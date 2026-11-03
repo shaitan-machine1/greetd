@@ -69,23 +69,28 @@ impl Context {
     }
 
     async fn post_response(&self, response: Option<String>) -> Result<(), Error> {
-        let mut s = self.inner.borrow_mut();
-        if s.ok {
-            return Err(Error::Error("wat".to_string()));
-        }
-        if s.user.is_none() {
-            s.user = response;
-        } else if s.password.is_none() {
-            s.password = response;
-        } else {
-            if s.user != Some("user".to_string())
-                || s.password != Some("password".to_string())
-                || response != Some("9".to_string())
-            {
-                sleep(Duration::from_millis(2000)).await;
-                return Err(Error::AuthError("nope".to_string()));
+        let rejected = {
+            let mut s = self.inner.borrow_mut();
+            if s.ok {
+                return Err(Error::Error("wat".to_string()));
             }
-            s.ok = true;
+            if s.user.is_none() {
+                s.user = response;
+                return Ok(());
+            }
+            if s.password.is_none() {
+                s.password = response;
+                return Ok(());
+            }
+            let valid = s.user == Some("user".to_string())
+                && s.password == Some("password".to_string())
+                && response == Some("9".to_string());
+            s.ok = valid;
+            !valid
+        };
+        if rejected {
+            sleep(Duration::from_millis(2000)).await;
+            return Err(Error::AuthError("nope".to_string()));
         }
         Ok(())
     }

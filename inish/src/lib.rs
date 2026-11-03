@@ -1,6 +1,6 @@
 use std::{collections::HashMap, error::Error};
 
-fn parse_field<'a>(line: &'a str) -> Result<(&'a str, &'a str), Box<dyn Error>> {
+fn parse_field(line: &str) -> Result<(&str, &str), Box<dyn Error>> {
     let split = match line.find('=') {
         Some(v) => v,
         None => return Err("expected equals sign on line, but found none".into()),
@@ -30,7 +30,7 @@ pub fn parse<'a>(s: &'a str) -> Result<Inish<'a>, Box<dyn Error>> {
             (Some('['), Some(']')) => {
                 sections.insert(current_section_name, current_section);
                 current_section = HashMap::new();
-                let len = line.bytes().count();
+                let len = line.len();
                 current_section_name = line[1..len - 1].trim();
             }
             (Some('['), v) => {

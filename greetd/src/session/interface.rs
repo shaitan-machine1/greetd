@@ -1,21 +1,17 @@
 use std::{
-    ffi::CString,
+    os::fd::OwnedFd,
+    os::unix::process::CommandExt,
     os::unix::{io::AsRawFd, net::UnixDatagram},
+    sync::Arc,
 };
 
-use nix::{
-    fcntl::{fcntl, FcntlArg, FdFlag},
-    sys::signal::Signal,
-    unistd::{execv, fork, ForkResult, Pid},
-};
+use nix::{sys::signal::Signal, unistd::Pid};
 
 use async_trait::async_trait;
 
 use tokio::net::UnixDatagram as TokioUnixDatagram;
 
-use super::worker::{
-    AuthMessageType, ParentToSessionChild, SessionChildToParent, SessionClass, TerminalMode,
-};
+use super::worker::{AuthMessageType, ParentToSessionChild, SessionChildToParent};
 use crate::{error::Error, scrambler::Scrambler};
 
 #[async_trait]
@@ -33,6 +29,10 @@ impl<'a> AsyncSend for ParentToSessionChild<'a> {
     async fn send(&self, sock: &mut TokioUnixDatagram) -> Result<(), Error> {
         let mut out =
             serde_json::to_vec(self).map_err(|e| format!("unable to serialize message: {}", e))?;
+        if out.len() > 10240 {
+            out.scramble();
+            return Err("session worker request exceeded its bounded frame".into());
+        }
         sock.send(&out)
             .await
             .map_err(|e| format!("unable to send message: {}", e))?;
@@ -59,6 +59,7 @@ impl AsyncRecv<SessionChildToParent> for SessionChildToParent {
 pub struct SessionChild {
     pub task: Pid,
     pub sub_task: Pid,
+    managed: Option<(crate::managed::Backend, Arc<OwnedFd>)>,
 }
 
 impl SessionChild {
@@ -69,13 +70,44 @@ impl SessionChild {
 
     /// Send SIGTERM to the session child.
     pub fn term(&self) {
-        let _ = nix::sys::signal::kill(self.sub_task, Signal::SIGTERM);
+        if let Some((backend, worker)) = &self.managed {
+            backend.remove(worker);
+            crate::managed::signal(worker, libc::SIGTERM);
+        } else {
+            let _ = nix::sys::signal::kill(self.sub_task, Signal::SIGTERM);
+        }
     }
 
     /// Send SIGKILL to the session child.
     pub fn kill(&self) {
-        let _ = nix::sys::signal::kill(self.sub_task, Signal::SIGKILL);
-        let _ = nix::sys::signal::kill(self.task, Signal::SIGKILL);
+        if let Some((backend, worker)) = &self.managed {
+            backend.force(worker);
+            crate::managed::signal(worker, libc::SIGTERM);
+        } else {
+            let _ = nix::sys::signal::kill(self.sub_task, Signal::SIGKILL);
+            let _ = nix::sys::signal::kill(self.task, Signal::SIGKILL);
+        }
+    }
+}
+
+impl Drop for SessionChild {
+    fn drop(&mut self) {
+        if let Some((backend, worker)) = &self.managed {
+            backend.release(worker);
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if !self.started {
+            if let Some((backend, worker)) = &self.managed {
+                backend.release(worker);
+                crate::managed::signal(worker, libc::SIGTERM);
+            } else {
+                let _ = nix::sys::signal::kill(self.task, Signal::SIGTERM);
+            }
+        }
     }
 }
 
@@ -87,6 +119,8 @@ pub enum SessionState {
 
 /// A device to initiate a logged in PAM session.
 pub struct Session {
+    managed: Option<(crate::managed::Backend, Arc<OwnedFd>)>,
+    started: bool,
     task: Pid,
     sock: TokioUnixDatagram,
     last_msg: Option<SessionChildToParent>,
@@ -94,63 +128,78 @@ pub struct Session {
 
 impl Session {
     /// Create a session started as an external process.
-    pub fn new_external() -> Result<Session, Error> {
+    pub fn new_external(backend: Option<crate::managed::Backend>) -> Result<Session, Error> {
         // Pipe used to communicate the true PID of the final child.
         let (parentfd, childfd) =
             UnixDatagram::pair().map_err(|e| format!("could not create pipe: {}", e))?;
 
+        parentfd.set_nonblocking(true)?;
+        let parentfd = TokioUnixDatagram::from_std(parentfd)?;
         let raw_child = childfd.as_raw_fd();
-        let mut cur_flags = FdFlag::from_bits_retain(fcntl(raw_child, FcntlArg::F_GETFD)?);
-        cur_flags.remove(FdFlag::FD_CLOEXEC);
-        fcntl(raw_child, FcntlArg::F_SETFD(cur_flags))?;
-
-        let cur_exe = std::env::current_exe()?;
-        let bin = CString::new(cur_exe.to_str().expect("unable to get current exe name"))?;
-
-        let child = match unsafe { fork() }.map_err(|e| format!("unable to fork: {}", e))? {
-            ForkResult::Parent { child, .. } => child,
-            ForkResult::Child => {
-                execv(
-                    &bin,
-                    &[
-                        &bin,
-                        &CString::new("--session-worker").unwrap(),
-                        &CString::new(format!("{}", raw_child as usize)).unwrap(),
-                    ],
-                )
-                .expect("unable to exec");
-
-                unreachable!("after exec");
+        let mut process = std::process::Command::new(std::env::current_exe()?);
+        process.args([
+            "--session-worker",
+            &raw_child.to_string(),
+            "--worker-parent",
+            &std::process::id().to_string(),
+        ]);
+        unsafe {
+            process.pre_exec(move || {
+                let flags = libc::fcntl(raw_child, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(raw_child, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = process.spawn()?;
+        let child = Pid::from_raw(child.id() as i32);
+        let managed = if let Some(backend) = backend {
+            let descriptor = crate::managed::pidfd(child.as_raw() as u32).inspect_err(|_| {
+                let _ = nix::sys::signal::kill(child, Signal::SIGTERM);
+            })?;
+            if let Err(error) = backend.track(descriptor.clone()) {
+                crate::managed::signal(&descriptor, libc::SIGTERM);
+                return Err(error);
             }
+            Some((backend, descriptor))
+        } else {
+            None
         };
-
         Ok(Session {
+            managed,
+            started: false,
             task: child,
-            sock: TokioUnixDatagram::from_std(parentfd)?,
+            sock: parentfd,
             last_msg: None,
         })
     }
 
+    async fn receive(&mut self) -> Result<SessionChildToParent, Error> {
+        if let Some((_, worker)) = &self.managed {
+            let descriptor = worker.try_clone()?;
+            let watched = unsafe { tokio::io::unix::AsyncFd::register(descriptor) }
+                .map_err(std::io::Error::from)?;
+            tokio::select! {
+                biased;
+                message = SessionChildToParent::recv(&mut self.sock) => message,
+                ready = watched.readable() => {
+                    let _ready = ready?;
+                    let mut data = [0; 10240];
+                    match self.sock.try_recv(&mut data) {
+                        Ok(length) => Ok(serde_json::from_slice(&data[..length])?),
+                        Err(_) => Err("managed PAM worker exited".into()),
+                    }
+                }
+            }
+        } else {
+            SessionChildToParent::recv(&mut self.sock).await
+        }
+    }
+
     /// Initiates the session, which will cause authentication to begin.
-    pub async fn initiate(
-        &mut self,
-        service: &str,
-        class: SessionClass,
-        user: &str,
-        authenticate: bool,
-        term_mode: &TerminalMode,
-        source_profile: bool,
-        listener_path: &str,
-    ) -> Result<(), Error> {
-        let msg = ParentToSessionChild::InitiateLogin {
-            service: service,
-            class: class,
-            user: user,
-            authenticate,
-            tty: term_mode.clone(),
-            source_profile,
-            listener_path: listener_path,
-        };
+    pub async fn initiate(&mut self, msg: ParentToSessionChild<'_>) -> Result<(), Error> {
         msg.send(&mut self.sock).await?;
         Ok(())
     }
@@ -159,7 +208,7 @@ impl Session {
     pub async fn get_state(&mut self) -> Result<SessionState, Error> {
         let msg = match self.last_msg.take() {
             Some(msg) => msg,
-            None => SessionChildToParent::recv(&mut self.sock).await?,
+            None => self.receive().await?,
         };
 
         self.last_msg = Some(msg.clone());
@@ -180,6 +229,11 @@ impl Session {
     /// Cancel the session.
     pub async fn cancel(&mut self) -> Result<(), Error> {
         self.last_msg = None;
+        if let Some((backend, worker)) = &self.managed {
+            backend.remove(worker);
+            crate::managed::signal(worker, libc::SIGTERM);
+            return Ok(());
+        }
         ParentToSessionChild::Cancel.send(&mut self.sock).await?;
         Ok(())
     }
@@ -206,7 +260,7 @@ impl Session {
         let msg = ParentToSessionChild::Args { env, cmd };
         msg.send(&mut self.sock).await?;
 
-        let msg = SessionChildToParent::recv(&mut self.sock).await?;
+        let msg = self.receive().await?;
 
         self.last_msg = Some(msg.clone());
 
@@ -228,10 +282,29 @@ impl Session {
         msg.send(&mut self.sock).await?;
 
         let sub_task = loop {
-            match SessionChildToParent::recv(&mut self.sock).await? {
+            match self.receive().await? {
                 SessionChildToParent::Error(e) => return Err(e),
+                SessionChildToParent::ManagedSession { session } => {
+                    let (backend, worker) =
+                        self.managed.as_ref().ok_or("unexpected managed metadata")?;
+                    backend.metadata(worker, None, session)?;
+                }
+                SessionChildToParent::ManagedContext { context, session } => {
+                    let (backend, worker) =
+                        self.managed.as_ref().ok_or("unexpected managed context")?;
+                    let context = context
+                        .parse::<libmultiseatd::ContextId>()
+                        .map_err(|error| error.to_string())?;
+                    backend.metadata(worker, Some(context), session)?;
+                    ParentToSessionChild::ManagedAcknowledged
+                        .send(&mut self.sock)
+                        .await?;
+                }
                 SessionChildToParent::FinalChildPid(raw_pid) => {
-                    break Pid::from_raw(raw_pid as i32)
+                    if let Some((backend, worker)) = &self.managed {
+                        backend.final_metadata(worker);
+                    }
+                    break Pid::from_raw(raw_pid as i32);
                 }
                 SessionChildToParent::PamMessage { .. } => {
                     // pam_conv after start, ignore
@@ -249,9 +322,11 @@ impl Session {
 
         self.sock.shutdown(std::net::Shutdown::Both)?;
 
+        self.started = true;
         Ok(SessionChild {
             task: self.task,
             sub_task,
+            managed: self.managed.take(),
         })
     }
 }

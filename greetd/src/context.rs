@@ -15,7 +15,10 @@ use crate::{
     scrambler::Scrambler,
     session::{
         interface::{Session, SessionChild, SessionState},
-        worker::{AuthMessageType as SessAuthMessageType, SessionClass, TerminalMode},
+        worker::{
+            AuthMessageType as SessAuthMessageType, ParentToSessionChild, SessionClass,
+            TerminalMode,
+        },
     },
 };
 use greetd_ipc::AuthMessageType;
@@ -48,18 +51,15 @@ pub struct Context {
     source_profile: bool,
     runfile: String,
     listener_path: String,
+    backend: Option<crate::managed::Backend>,
 }
 
 impl Context {
     pub fn new(
-        greeter_bin: String,
-        greeter_user: String,
-        greeter_service: String,
-        pam_service: String,
+        config: crate::config::ConfigFile,
         term_mode: TerminalMode,
-        source_profile: bool,
-        runfile: String,
         listener_path: String,
+        backend: Option<crate::managed::Backend>,
     ) -> Context {
         Context {
             inner: RwLock::new(ContextInner {
@@ -67,14 +67,15 @@ impl Context {
                 scheduled: None,
                 configuring: None,
             }),
-            greeter_bin,
-            greeter_user,
-            greeter_service,
-            pam_service,
+            greeter_bin: config.default_session.command,
+            greeter_user: config.default_session.user,
+            greeter_service: config.default_session.service,
+            pam_service: config.general.service,
             term_mode,
-            source_profile,
-            runfile,
+            source_profile: config.general.source_profile,
+            runfile: config.general.runfile,
             listener_path,
+            backend,
         }
     }
 
@@ -88,17 +89,20 @@ impl Context {
         service: &str,
         cmd: Vec<String>,
     ) -> Result<SessionChild, Error> {
-        let mut scheduled_session = Session::new_external()?;
+        if let TerminalMode::Managed(settings) = &self.term_mode {
+            settings.arguments(&cmd)?;
+        }
+        let mut scheduled_session = Session::new_external(self.backend.clone())?;
         scheduled_session
-            .initiate(
+            .initiate(ParentToSessionChild::InitiateLogin {
                 service,
                 class,
                 user,
-                false,
-                &self.term_mode,
-                self.source_profile,
-                &self.listener_path,
-            )
+                authenticate: false,
+                tty: self.term_mode.clone(),
+                source_profile: self.source_profile,
+                listener_path: &self.listener_path,
+            })
             .await?;
         loop {
             match scheduled_session.get_state().await {
@@ -109,7 +113,9 @@ impl Context {
         }
 
         scheduled_session.send_args(cmd, vec![]).await?;
-        scheduled_session.start().await
+        tokio::time::timeout(Duration::from_secs(60), scheduled_session.start())
+            .await
+            .map_err(|_| Error::Error("session startup deadline exceeded".into()))?
     }
 
     /// Directly start a greeter session, bypassing the normal scheduling. This
@@ -182,6 +188,14 @@ impl Context {
             if inner.current.is_none() {
                 return Err("session not active".into());
             }
+            if self.backend.is_some()
+                && inner
+                    .current
+                    .as_ref()
+                    .is_some_and(|session| !session.is_greeter)
+            {
+                return Err("only the current greeter may configure a login".into());
+            }
             if inner.configuring.is_some() {
                 return Err("a session is already being configured".into());
             }
@@ -191,20 +205,20 @@ impl Context {
         }
 
         let mut session_set = SessionSet {
-            session: Session::new_external()?,
+            session: Session::new_external(self.backend.clone())?,
             time: Instant::now(),
         };
         session_set
             .session
-            .initiate(
-                &self.pam_service,
-                SessionClass::User,
-                &username,
-                true,
-                &self.term_mode,
-                self.source_profile,
-                &self.listener_path,
-            )
+            .initiate(ParentToSessionChild::InitiateLogin {
+                service: &self.pam_service,
+                class: SessionClass::User,
+                user: &username,
+                authenticate: true,
+                tty: self.term_mode.clone(),
+                source_profile: self.source_profile,
+                listener_path: &self.listener_path,
+            })
             .await?;
 
         let mut session = Some(session_set);
@@ -261,13 +275,16 @@ impl Context {
                 if let Some(mut answer) = answer {
                     answer.scramble();
                 }
-                return Err("no session under configuration".into());
+                Err("no session under configuration".into())
             }
         }
     }
 
     /// Schedule the session under configuration with the provided arguments.
     pub async fn start(&self, cmd: Vec<String>, env: Vec<String>) -> Result<(), Error> {
+        if let TerminalMode::Managed(settings) = &self.term_mode {
+            settings.arguments(&cmd)?;
+        }
         let mut session = self.inner.write().await.configuring.take();
 
         match &mut session {
@@ -318,7 +335,10 @@ impl Context {
                 return Ok(());
             }
             drop(inner);
-            let s = match p.session.start().await {
+            let s = match tokio::time::timeout(Duration::from_secs(60), p.session.start())
+                .await
+                .map_err(|_| Error::Error("session startup deadline exceeded".into()))?
+            {
                 Ok(s) => s,
                 Err(e) => return Err(format!("session start failed: {}", e).into()),
             };
@@ -358,7 +378,13 @@ impl Context {
                             // Our greeter finally bit the dust so we can
                             // start our scheduled session.
                             drop(inner);
-                            let s = match scheduled.session.start().await {
+                            let s = match tokio::time::timeout(
+                                Duration::from_secs(60),
+                                scheduled.session.start(),
+                            )
+                            .await
+                            .map_err(|_| Error::Error("session startup deadline exceeded".into()))?
+                            {
                                 Ok(s) => s,
                                 Err(e) => return Err(format!("session start failed: {}", e).into()),
                             };
@@ -370,7 +396,7 @@ impl Context {
                             });
                         }
                         None => {
-                            if was_greeter {
+                            if was_greeter && self.backend.is_none() {
                                 return Err("greeter exited without creating a session".into());
                             }
                             if sesion_length < Duration::from_secs(1) {
@@ -412,6 +438,21 @@ impl Context {
         }
         if let Some(sess) = inner.current.take() {
             sess.child.term();
+            if self.backend.is_some() {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match waitpid(sess.child.task, Some(WaitPidFlag::WNOHANG)) {
+                        Ok(WaitStatus::StillAlive) if Instant::now() < deadline => {
+                            sleep(Duration::from_millis(25)).await
+                        }
+                        Ok(WaitStatus::StillAlive) => {
+                            sess.child.kill();
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            }
         }
         Ok(())
     }

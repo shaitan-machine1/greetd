@@ -1,42 +1,35 @@
-use std::{default::Default, ffi::CString};
+use std::ffi::CString;
 
-/// Scrambling overwrites a buffers content with the default value. Useful to
-/// avoid leaving behind a heap littered with old secrets.
+/// Overwrite secret buffers before releasing their storage.
 pub trait Scrambler {
     fn scramble(&mut self);
 }
-
-impl<T: Default> Scrambler for Vec<T> {
-    fn scramble(&mut self) {
-        let cap = self.capacity();
-        self.truncate(0);
-        for _ in 0..cap {
-            self.push(Default::default())
+fn overwrite(bytes: &mut [u8]) {
+    for byte in bytes {
+        unsafe {
+            std::ptr::write_volatile(byte, 0);
         }
-        self.truncate(0);
     }
 }
-
+impl Scrambler for Vec<u8> {
+    fn scramble(&mut self) {
+        self.resize(self.capacity(), 0);
+        overwrite(self);
+        self.clear();
+    }
+}
 impl Scrambler for String {
     fn scramble(&mut self) {
-        let v = unsafe { self.as_mut_vec() };
-        for idx in 0..v.len() {
-            v[idx] = 0
+        unsafe {
+            let bytes = self.as_mut_vec();
+            overwrite(bytes);
+            bytes.clear();
         }
-        self.truncate(0);
     }
 }
-
 impl Scrambler for CString {
     fn scramble(&mut self) {
-        unsafe {
-            let ptr = self.as_ptr();
-            let mut offset = 0;
-
-            while *ptr.offset(offset) != 0 {
-                *(ptr.offset(offset) as *mut i8) = 0;
-                offset += 1;
-            }
-        }
+        let mut bytes = std::mem::take(self).into_bytes_with_nul();
+        overwrite(&mut bytes);
     }
 }

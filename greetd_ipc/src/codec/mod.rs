@@ -12,6 +12,18 @@
 
 use thiserror::Error as ThisError;
 
+/// Bound server/client frame allocation before decoding untrusted input.
+pub const MAX_FRAME: usize = 65536;
+pub(super) fn check_size(length: usize) -> Result<(), Error> {
+    if length == 0 || length > MAX_FRAME {
+        Err(Error::Serialization(
+            "invalid or oversized IPC frame".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Debug, ThisError)]
 pub enum Error {
     #[error("serialization error: {0}")]

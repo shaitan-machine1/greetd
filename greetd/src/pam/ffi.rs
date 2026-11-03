@@ -25,7 +25,7 @@ unsafe fn to_cstr(mut s: String) -> *mut c_char {
     }
     memcpy(a as *mut c_void, s.as_ptr() as *const c_void, s.len());
     s.scramble();
-    return a;
+    a
 }
 
 pub extern "C" fn converse(

@@ -26,7 +26,7 @@ fn reset_vt(term_mode: &TerminalMode) -> Result<(), Error> {
             term.kd_setmode(terminal::KdMode::Text)?;
             term.vt_setactivate(*vt)?;
         }
-        TerminalMode::Stdin => (),
+        TerminalMode::Stdin | TerminalMode::Managed(_) => (),
     }
     Ok(())
 }
@@ -37,7 +37,7 @@ fn wait_vt(term_mode: &TerminalMode) -> Result<(), Error> {
             let term = Terminal::open(path)?;
             term.vt_waitactive(*vt)?;
         }
-        TerminalMode::Stdin => (),
+        TerminalMode::Stdin | TerminalMode::Managed(_) => (),
     }
     Ok(())
 }
@@ -70,7 +70,10 @@ async fn client_handler(ctx: &Context, mut s: UnixStream) -> Result<(), Error> {
     loop {
         let req = match Request::read_from(&mut s).await {
             Ok(req) => req,
-            Err(CodecError::Eof) => return Ok(()),
+            Err(CodecError::Eof) => {
+                let _ = ctx.cancel().await;
+                return Ok(());
+            }
             Err(e) => return Err(e.into()),
         };
 
@@ -89,6 +92,9 @@ async fn client_handler(ctx: &Context, mut s: UnixStream) -> Result<(), Error> {
             Request::CancelSession => wrap_result(ctx.cancel().await),
         };
 
+        if matches!(resp, Response::Error { .. }) {
+            let _ = ctx.cancel().await;
+        }
         resp.write_to(&mut s).await?;
     }
 }
@@ -108,6 +114,9 @@ async fn client_handler(ctx: &Context, mut s: UnixStream) -> Result<(), Error> {
 //
 // If the target is VtSelection::None, return nothing.
 fn get_tty(config: &Config) -> Result<TerminalMode, Error> {
+    if let Some(settings) = &config.file.general.multiseat {
+        return Ok(TerminalMode::Managed(settings.clone()));
+    }
     const TTY_PREFIX: &str = "/dev/tty";
     const PTS_PREFIX: &str = "/dev/pts";
 
@@ -166,27 +175,54 @@ fn get_tty(config: &Config) -> Result<TerminalMode, Error> {
             switch: config.file.terminal.switch,
         },
     };
-    return Ok(term);
+    Ok(term)
 }
 
 // Listener is a convenience wrapper for creating the UnixListener we need, and
 // for providing cleanup on Drop.
-struct Listener(UnixListener);
+struct Listener(UnixListener, Option<std::fs::File>);
 
 impl Listener {
-    fn create(uid: Uid, gid: Gid) -> Result<(String, Listener), Error> {
-        let path = format!("/run/greetd-{}.sock", getpid().as_raw());
+    fn create(
+        uid: Uid,
+        gid: Gid,
+        settings: Option<&crate::managed::Settings>,
+    ) -> Result<(String, Listener), Error> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let (path, lock) = if let Some(settings) = settings {
+            std::fs::create_dir_all(&settings.directory)?;
+            let metadata = std::fs::symlink_metadata(&settings.directory)?;
+            if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+                return Err("managed run directory must be root-owned and non-writable".into());
+            }
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(format!("{}/controller.lock", settings.directory))?;
+            use std::os::fd::AsRawFd;
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
+                return Err("another greetd owns this managed instance".into());
+            }
+            (format!("{}/greetd.sock", settings.directory), Some(lock))
+        } else {
+            (format!("/run/greetd-{}.sock", getpid().as_raw()), None)
+        };
         let _ = std::fs::remove_file(&path);
         let listener =
             UnixListener::bind(&path).map_err(|e| format!("unable to open listener: {}", e))?;
         chown(path.as_str(), Some(uid), Some(gid))
             .map_err(|e| format!("unable to chown greetd socket at {}: {}", path, e))?;
-        Ok((path, Listener(listener)))
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        Ok((path, Listener(listener, lock)))
     }
 }
 
 impl Drop for Listener {
     fn drop(&mut self) {
+        let _lock = &self.1;
         let addr = match self.0.local_addr() {
             Ok(addr) => addr,
             Err(_) => return,
@@ -197,39 +233,55 @@ impl Drop for Listener {
     }
 }
 
-pub async fn main(config: Config) -> Result<(), Error> {
-    let service = if Path::new(&format!("/etc/pam.d/{}", config.file.general.service)).exists() {
-        &config.file.general.service
-    } else if Path::new(&format!("/usr/lib/pam.d/{}", config.file.general.service)).exists() {
-        &config.file.general.service
+async fn backend_failed(backend: Option<&crate::managed::Backend>) {
+    match backend {
+        Some(backend) => backend.failed().await,
+        None => std::future::pending().await,
+    }
+}
+
+pub async fn main(mut config: Config) -> Result<(), Error> {
+    let settings = config.file.general.multiseat.clone();
+    let available = |name: &str| {
+        if let Some(directory) = settings
+            .as_ref()
+            .and_then(|settings| settings.test_pam_dir.as_ref())
+        {
+            return Path::new(directory).join(name).is_file();
+        }
+        Path::new(&format!("/etc/pam.d/{}", name)).exists()
+            || Path::new(&format!("/usr/lib/pam.d/{}", name)).exists()
+    };
+    let service = if available(&config.file.general.service) {
+        config.file.general.service.clone()
     } else {
         return Err(format!("PAM '{}' service missing", config.file.general.service).into());
     };
 
-    let greeter_service = if Path::new(&format!(
-        "/etc/pam.d/{}",
-        config.file.default_session.service
-    ))
-    .exists()
-    {
-        &config.file.default_session.service
-    } else if Path::new(&format!(
-        "/usr/lib/pam.d/{}",
-        config.file.default_session.service
-    ))
-    .exists()
-    {
-        &config.file.default_session.service
+    let greeter_service = if available(&config.file.default_session.service) {
+        config.file.default_session.service.clone()
+    } else if settings.is_some() {
+        return Err("managed greeter PAM service is missing; no user-service fallback".into());
     } else {
-        service
+        service.clone()
     };
+    let owner = if let Some(settings) = &settings {
+        if unsafe { libc::geteuid() } != 0 {
+            return Err("managed greetd must run as root".into());
+        }
+        settings.validate_launcher()?;
+        Some(crate::managed::Owner::start(settings.clone())?)
+    } else {
+        None
+    };
+    let backend = owner.as_ref().map(crate::managed::Owner::backend);
 
     let u = nix::unistd::User::from_name(&config.file.default_session.user)?.ok_or(format!(
         "configured default session user '{}' not found",
-        &config.file.default_session.user
+        config.file.default_session.user
     ))?;
 
-    let (listener_path, listener) = Listener::create(u.uid, u.gid)?;
+    let (listener_path, listener) = Listener::create(u.uid, u.gid, settings.as_ref())?;
 
     let term_mode = get_tty(&config)?;
 
@@ -237,29 +289,28 @@ pub async fn main(config: Config) -> Result<(), Error> {
         wait_vt(&term_mode).map_err(|e| format!("unable to wait VT: {}", e))?;
     }
 
+    let initial_session = config.file.initial_session.take();
+    config.file.general.service = service;
+    config.file.default_session.service = greeter_service;
     let ctx = Rc::new(Context::new(
-        config.file.default_session.command,
-        config.file.default_session.user,
-        greeter_service.to_string(),
-        service.to_string(),
+        config.file,
         term_mode.clone(),
-        config.file.general.source_profile,
-        config.file.general.runfile,
         listener_path,
+        backend.clone(),
     ));
 
-    if let (Some(s), true) = (config.file.initial_session, ctx.is_first_run()) {
+    if let (Some(s), true) = (initial_session, ctx.is_first_run()) {
         if let Err(e) = ctx.start_user_session(&s.user, vec![s.command]).await {
             eprintln!("unable to start greeter: {}", e);
             reset_vt(&term_mode).map_err(|e| format!("unable to reset VT: {}", e))?;
 
-            std::process::exit(1);
+            return Err(e);
         }
     } else if let Err(e) = ctx.greet().await {
         eprintln!("unable to start greeter: {}", e);
         reset_vt(&term_mode).map_err(|e| format!("unable to reset VT: {}", e))?;
 
-        std::process::exit(1);
+        return Err(e);
     }
 
     ctx.create_runfile();
@@ -269,24 +320,31 @@ pub async fn main(config: Config) -> Result<(), Error> {
     let mut term = signal(SignalKind::terminate()).expect("unable to listen for SIGTERM");
     let mut int = signal(SignalKind::interrupt()).expect("unable to listen for SIGINT");
 
+    let clients = std::sync::Arc::new(tokio::sync::Semaphore::new(32));
     loop {
         tokio::select! {
+            _ = backend_failed(backend.as_ref()) => { if let Some(backend) = &backend { backend.stop_workers(); } ctx.terminate().await?; return Err("multiseatd owner or configured seat was lost".into()); }
             _ = child.recv() => ctx.check_children().await.map_err(|e| format!("check_children: {}", e))?,
             _ = alarm.recv() => ctx.alarm().await.map_err(|e| format!("alarm: {}", e))?,
             _ = term.recv() => {
+                if let Some(backend) = &backend { backend.stop_workers(); }
                 ctx.terminate().await.map_err(|e| format!("terminate: {}", e))?;
                 break;
             }
             _ = int.recv() => {
+                if let Some(backend) = &backend { backend.stop_workers(); }
                 ctx.terminate().await.map_err(|e| format!("terminate: {}", e))?;
                 break;
             }
             stream = listener.0.accept() => match stream {
                 Ok((stream, _)) => {
+                    if settings.is_some() && !matches!(stream.peer_cred()?.uid(), uid if uid == 0 || uid == u.uid.as_raw()) { continue; }
+                    let permit = match clients.clone().try_acquire_owned() { Ok(permit) => permit, Err(_) => continue };
                     let client_ctx = ctx.clone();
                     task::spawn_local(async move {
+                        let _permit = permit;
                         if let Err(e) = client_handler(&client_ctx, stream).await {
-                            client_ctx.cancel().await.expect("unable to cancel session");
+                            if let Err(error) = client_ctx.cancel().await { eprintln!("session cancellation failed: {}", error); }
                             eprintln!("client loop failed: {}", e);
                         }
                     });
