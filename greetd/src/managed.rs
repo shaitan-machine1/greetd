@@ -76,10 +76,16 @@ impl Settings {
         }
         Ok(argv)
     }
+    pub fn validate_command(&self, arguments: &[String]) -> Result<(), Error> {
+        validate_executable(arguments.first().ok_or("missing managed executable")?)
+    }
     pub fn validate_launcher(&self) -> Result<(), Error> {
         self.validate()?;
-        for path in std::iter::once(&self.launcher).chain(self.entrypoints.iter()) {
-            validate_executable(path)?;
+        validate_executable(&self.launcher)?;
+        for path in &self.entrypoints {
+            if Path::new(path).try_exists()? {
+                validate_executable(path)?;
+            }
         }
         Ok(())
     }

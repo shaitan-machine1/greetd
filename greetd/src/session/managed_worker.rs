@@ -118,6 +118,7 @@ pub fn run(
     pam: &mut PamSession<'_>,
 ) -> Result<(), Error> {
     let arguments = settings.arguments(&command)?;
+    settings.validate_command(&arguments)?;
     if environment.len() > 256 {
         return Err("too many session environment variables".into());
     }
