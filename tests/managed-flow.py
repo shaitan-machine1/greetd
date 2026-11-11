@@ -34,12 +34,10 @@ def authenticate(password):
     return request({'type':'post_auth_message_response','response':password})
 assert authenticate('wrong')['type'] == 'error'
 assert authenticate('fixture-password')['type'] == 'success'
-# Unwrapped commands must be rejected before full authority can reach a shell.
-reply = request({'type':'start_session','cmd':['/bin/sh','-c','exit 0']})
-assert reply['type'] == 'error', reply
-assert authenticate('fixture-password')['type'] == 'success'
-launch = [] if os.environ.get('GREETD_NATIVE') == '1' else [work+'/seat-launch']
-reply = request({'type':'start_session', 'cmd':launch+[work+'/seat-client','user',work+'/apps.log',work+'/fixtures/seat-test/direct'],
+# A user-owned entrypoint receives authority like the greeter compositor;
+# there is no wrapper recognition or trusted-executable allowlist.
+launch = [work+'/with-seat'] if os.environ.get('GREETD_NATIVE') == '0' else []
+reply = request({'type':'start_session', 'cmd':[work+'/user-entrypoint']+launch+[work+'/seat-client','user',work+'/apps.log',work+'/fixtures/seat-test/direct'],
                  'env':['XDG_SEAT=seat-spoofed','XDG_VTNR=63','XDG_RUNTIME_DIR=/bad','LD_PRELOAD=/bad.so','DBUS_SYSTEM_BUS_ADDRESS=unix:path=/bad','MULTISEATD_AUTHORITY_FD=2','WLR_BACKENDS=headless']})
 assert reply['type'] == 'success', reply
 peer.close()

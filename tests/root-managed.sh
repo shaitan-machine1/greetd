@@ -4,7 +4,7 @@ set -euo pipefail
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 if (( EUID != 0 )); then
     for tool in cargo cc sudo python3 dbus-daemon gdbus; do command -v "$tool" >/dev/null || exit 77; done
-    for variable in MULTISEATD_BINARY SEAT_LAUNCH_BINARY LIBSEAT_SOURCE LIBSEAT_BUILD; do [[ -n ${!variable:-} ]] || { echo "explicit $variable is required" >&2; exit 77; }; done
+    for variable in MULTISEATD_BINARY WITH_SEAT_BINARY LIBSEAT_SOURCE LIBSEAT_BUILD; do [[ -n ${!variable:-} ]] || { echo "explicit $variable is required" >&2; exit 77; }; done
     sudo -n true || exit 77
     extra=(); if [[ -n ${GREETD_CARGO_CONFIG:-} ]]; then extra+=(--config "$GREETD_CARGO_CONFIG"); fi
     cargo build --manifest-path "$repo/Cargo.toml" "${extra[@]}" --locked -p greetd --features test-support
@@ -17,7 +17,7 @@ if (( EUID != 0 )); then
         cc -Wall -Wextra -Werror -fPIC -shared "$repo/tests/fixtures/headless-session.c" $(pkg-config --cflags --libs wlroots-0.20 wayland-server) -I"$LIBSEAT_SOURCE/include" -L"$LIBSEAT_BUILD" -lseat -o "$build/headless-session.so"
         cc -Wall -Wextra -Werror "$repo/tests/fixtures/ui-exec.c" -o "$build/ui-exec"
     fi
-    sudo -n env GREETD_NATIVE="${GREETD_NATIVE:-0}" CAGE_BINARY="${CAGE_BINARY:-}" REGREET_BINARY="${REGREET_BINARY:-}" LIBSEAT_BUILD="$LIBSEAT_BUILD" MULTISEATD_BINARY="$MULTISEATD_BINARY" SEAT_LAUNCH_BINARY="$SEAT_LAUNCH_BINARY" GREETD_FIXTURE_BUILD="$build" timeout --signal=TERM --kill-after=10s 150s bash "$0" --root
+    sudo -n env GREETD_NATIVE="${GREETD_NATIVE:-1}" CAGE_BINARY="${CAGE_BINARY:-}" REGREET_BINARY="${REGREET_BINARY:-}" LIBSEAT_BUILD="$LIBSEAT_BUILD" MULTISEATD_BINARY="$MULTISEATD_BINARY" WITH_SEAT_BINARY="$WITH_SEAT_BINARY" GREETD_FIXTURE_BUILD="$build" timeout --signal=TERM --kill-after=10s 150s bash "$0" --root
     exit $?
 fi
 work=$(mktemp -d /tmp/greetd-managed.XXXXXX)
@@ -32,12 +32,14 @@ cleanup() {
 trap cleanup EXIT
 cp "$repo/target/debug/greetd" "$work/greetd"
 cp "$MULTISEATD_BINARY" "$work/multiseatd"
-cp "$SEAT_LAUNCH_BINARY" "$work/seat-launch"
+cp "$WITH_SEAT_BINARY" "$work/with-seat"
 cp "$GREETD_FIXTURE_BUILD/seat-client" "$work/seat-client"
 cp "$GREETD_FIXTURE_BUILD/pam_fixture.so" "$work/pam_fixture.so"
-chmod 755 "$work/greetd" "$work/multiseatd" "$work/seat-launch" "$work/seat-client"
+chmod 755 "$work/greetd" "$work/multiseatd" "$work/with-seat" "$work/seat-client"
 mkdir "$work/pam.d" "$work/runtime" "$work/fixtures"
 chmod 755 "$work/runtime"
+printf '%s\n' '#!/bin/sh' 'exec "$@"' >"$work/user-entrypoint"
+chown nobody "$work/user-entrypoint"; chmod 700 "$work/user-entrypoint"
 touch "$work/apps.log" "$work/pam.log"; chmod 666 "$work/apps.log"
 for service in greetd-test greetd-test-greeter; do
     printf '%s\n' "auth required $work/pam_fixture.so user=nobody trace=$work/pam.log" 'account required pam_permit.so' "session required $work/pam_fixture.so trace=$work/pam.log runtime=$work/runtime" >"$work/pam.d/$service"
@@ -47,8 +49,8 @@ dbus-daemon --nofork --config-file="$work/bus.conf" >"$work/bus.log" 2>&1 & bus=
 for ((i=0;i<200;i++)); do [[ -S $work/bus ]] && break; sleep .02; done
 chmod 666 "$work/bus"; export DBUS_SYSTEM_BUS_ADDRESS="unix:path=$work/bus"
 contexts() { gdbus call --system --dest "org.SGLogin.Multiseatd1.Seat_seat_2d$1" --object-path /org/SGLogin/Multiseatd1 --method org.SGLogin.Multiseatd1.Manager.ListContexts; }
-compositor="$work/seat-launch $work/seat-client"
-if [[ ${GREETD_NATIVE:-0} == 1 ]]; then compositor="$work/seat-client"; fi
+compositor="$work/with-seat $work/seat-client"
+if [[ ${GREETD_NATIVE:-1} == 1 ]]; then compositor="$work/seat-client"; fi
 for seat in seat-test seat-other; do
     mkdir -m 700 "$work/fixtures/$seat"; touch "$work/fixtures/$seat/direct"; chmod 600 "$work/fixtures/$seat/direct"
     "$work/multiseatd" --seat "$seat" --test-only --test-root "$work/fixtures/$seat" --lock-file "$work/fixtures/$seat/daemon.lock" --bus-address "$DBUS_SYSTEM_BUS_ADDRESS" --test-direct-node "$work/fixtures/$seat/direct" >"$work/$seat-daemon.log" 2>&1 &
@@ -59,7 +61,7 @@ for seat in seat-test seat-other; do
     # root-owned directory so UID ACL access can be exercised by the app. It
     # remains non-writable; production paths/devices are never involved.
     chmod 711 "$work/fixtures/$seat"
-    printf '%s\n' '[general]' 'service = "greetd-test"' '[multiseat]' "seat = \"$seat\"" 'vt = 0' "launcher = \"$work/seat-launch\"" "trusted_entrypoints = \"$work/seat-client\"" "run_directory = \"$work/$seat\"" "test_pam_dir = \"$work/pam.d\"" '[default_session]' "command = \"$compositor greeter $work/apps.log $work/fixtures/$seat/direct\"" 'user = "nobody"' 'service = "greetd-test-greeter"' >"$work/$seat.conf"
+    printf '%s\n' '[general]' 'service = "greetd-test"' '[multiseat]' "seat = \"$seat\"" 'vt = 0' "run_directory = \"$work/$seat\"" "test_pam_dir = \"$work/pam.d\"" '[default_session]' "command = \"$compositor greeter $work/apps.log $work/fixtures/$seat/direct\"" 'user = "nobody"' 'service = "greetd-test-greeter"' >"$work/$seat.conf"
 done
 # A non-VT binding rejection must occur before PAM authentication/session open.
 if GREETD_TEST_MODE=1 "$work/greetd" --config "$work/seat-test.conf" --seat seat-test --vt 7 >"$work/binding.log" 2>&1; then echo 'invalid immutable binding was accepted' >&2; exit 1; fi
@@ -130,7 +132,6 @@ work, library = sys.argv[1:]
 path = work+'/graphical.conf'
 text = open(path).read().replace('[default_session]', 'test_preload = "'+work+'/headless-session.so"\ntest_library_path = "'+library+'"\n[default_session]')
 text = text.replace(work+'/seat-client greeter '+work+'/apps.log '+work+'/fixtures/seat-test/direct', work+'/cage -- '+work+'/ui-exec '+work+'/ui.log '+work+'/regreet --logs '+work+'/regreet.log')
-text = text.replace('trusted_entrypoints = "'+work+'/seat-client"', 'trusted_entrypoints = "'+work+'/seat-client '+work+'/cage"')
 open(path, 'w').write(text)
 PY
     GREETD_TEST_MODE=1 "$work/greetd" --config "$work/graphical.conf" >"$work/graphical.log" 2>&1 & graphical=$!

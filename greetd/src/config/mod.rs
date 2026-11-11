@@ -185,8 +185,6 @@ fn parse_config(config_str: &str) -> Result<ConfigFile, Error> {
                 *key,
                 "seat"
                     | "vt"
-                    | "launcher"
-                    | "trusted_entrypoints"
                     | "run_directory"
                     | "test_pam_dir"
                     | "test_preload"
@@ -196,11 +194,6 @@ fn parse_config(config_str: &str) -> Result<ConfigFile, Error> {
             }
         }
         let seat = maybe_unquote(section.get("seat").ok_or("multiseat.seat is required")?)?;
-        let launcher = maybe_unquote(
-            section
-                .get("launcher")
-                .unwrap_or(&"/usr/libexec/multiseatd/seat-launch"),
-        )?;
         let directory = match section.get("run_directory") {
             Some(value) => maybe_unquote(value)?,
             None => format!("/run/greetd-{}", seat),
@@ -214,12 +207,6 @@ fn parse_config(config_str: &str) -> Result<ConfigFile, Error> {
                 .unwrap_or_else(|| "0".into())
                 .parse::<u32>()
                 .map_err(|error| error.to_string())?,
-            launcher,
-            entrypoints: match section.get("trusted_entrypoints") {
-                Some(value) => shlex::split(&maybe_unquote(value)?)
-                    .ok_or("invalid trusted_entrypoints quoting")?,
-                None => Vec::new(),
-            },
             directory,
             system_bus: env::var("DBUS_SYSTEM_BUS_ADDRESS").ok(),
             test_pam_dir: section
@@ -242,7 +229,7 @@ fn parse_config(config_str: &str) -> Result<ConfigFile, Error> {
             .is_some()
             && general.source_profile
         {
-            return Err("source_profile is forbidden before the trusted managed launcher".into());
+            return Err("source_profile is forbidden in managed mode".into());
         }
         general.source_profile = false;
         general.runfile = format!("{}/started-{}", setting.directory, setting.instance());
@@ -602,8 +589,9 @@ vt = current
     }
 
     #[test]
-    fn managed_config_disables_terminal_and_profiles_and_bounds_delegation() {
-        let base = "[default_session]\ncommand = \"/usr/libexec/multiseatd/seat-launch /usr/bin/cage -- /usr/bin/regreet\"\n[multiseat]\nseat = \"seat-test\"\ntrusted_entrypoints = \"/usr/bin/sglogin-weston\"\n";
+    fn managed_config_disables_terminal_and_profiles_without_command_policy() {
+        let base =
+            "[default_session]\ncommand = \"cage -- regreet\"\n[multiseat]\nseat = \"seat-test\"\n";
         let config = parse_config(base).unwrap();
         assert_eq!(config.terminal.vt, VtSelection::None);
         assert!(!config.terminal.switch);
@@ -618,12 +606,23 @@ vt = current
         assert_ne!(a.instance(), b.instance());
         assert_ne!(a.socket_path(), b.socket_path());
         assert!(parse_config(&format!("{base}vt = 64\n")).is_err());
-        assert!(settings
-            .arguments(&["/usr/bin/sglogin-weston".into()])
-            .is_ok());
-        assert!(settings
-            .arguments(&["/bin/sh".into(), "-c".into(), "true".into()])
-            .is_err());
+        for command in [
+            vec!["weston".into()],
+            vec!["/bin/sh".into(), "-c".into(), "true".into()],
+            vec!["./user-owned-entrypoint".into()],
+        ] {
+            assert!(settings.arguments(&command).is_ok());
+        }
+        assert_eq!(
+            settings
+                .arguments(&["weston --backend=drm-backend.so".into()])
+                .unwrap(),
+            ["weston", "--backend=drm-backend.so"]
+        );
+        assert!(settings.arguments(&[]).is_err());
+        assert!(settings.arguments(&[String::new()]).is_err());
+        assert!(parse_config(&format!("{base}launcher = \"old-wrapper\"\n")).is_err());
+        assert!(parse_config(&format!("{base}trusted_entrypoints = \"weston\"\n")).is_err());
         assert!(parse_config(&format!("{base}unknown = true\n")).is_err());
         assert!(parse_config(&format!("{base}[terminal]\nvt = 1\n")).is_err());
         assert!(parse_config(&format!("{base}[general]\nsource_profile = true\n")).is_err());

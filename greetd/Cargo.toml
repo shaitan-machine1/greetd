@@ -25,6 +25,6 @@ thiserror = "1.0"
 async-trait = "0.1"
 enquote = "1.1"
 shlex = "1.3"
-lib-multiseatd = { git = "https://github.com/shaitan-machine1/multiseatd.git", tag = "v0.4.0" }
+lib-multiseatd = { git = "https://github.com/shaitan-machine1/multiseatd.git", tag = "v0.4.1" }
 lib-sessiond = { git = "https://github.com/shaitan-machine1/sessiond.git", rev = "27ef72702556cf1018888eac25aaf655a6efd743" }
 dbus = "0.9.12"

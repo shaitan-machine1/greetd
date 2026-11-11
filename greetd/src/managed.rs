@@ -6,7 +6,7 @@ use std::{
     collections::BTreeMap,
     os::{
         fd::{AsRawFd, OwnedFd},
-        unix::{fs::MetadataExt, net::UnixDatagram},
+        unix::net::UnixDatagram,
     },
     path::Path,
     sync::{
@@ -20,8 +20,6 @@ use std::{
 pub struct Settings {
     pub seat: String,
     pub vt: u32,
-    pub launcher: String,
-    pub entrypoints: Vec<String>,
     pub directory: String,
     pub system_bus: Option<String>,
     pub test_pam_dir: Option<String>,
@@ -40,16 +38,8 @@ impl Settings {
         if self.vt > 63 {
             return Err("managed VT must be 0 or 1..63".into());
         }
-        if self.entrypoints.len() > 16
-            || self
-                .entrypoints
-                .iter()
-                .any(|path| !Path::new(path).is_absolute())
-        {
-            return Err("at most 16 absolute trusted entrypoints are allowed".into());
-        }
-        if !Path::new(&self.launcher).is_absolute() || !Path::new(&self.directory).is_absolute() {
-            return Err("managed launcher/run directory must be absolute".into());
+        if !Path::new(&self.directory).is_absolute() {
+            return Err("managed run directory must be absolute".into());
         }
         if (self.test_pam_dir.is_some()
             || self.test_preload.is_some()
@@ -66,59 +56,11 @@ impl Settings {
         } else {
             command.to_vec()
         };
-        if argv.is_empty()
-            || (argv[0] != self.launcher && !self.entrypoints.contains(&argv[0]))
-            || (argv[0] == self.launcher && argv.len() < 2)
-        {
-            return Err(
-                "managed sessions must begin with seat-launch or an explicitly trusted entrypoint"
-                    .into(),
-            );
+        if argv.first().is_none_or(String::is_empty) {
+            return Err("missing managed command".into());
         }
         Ok(argv)
     }
-    pub fn validate_command(&self, arguments: &[String]) -> Result<(), Error> {
-        validate_executable(arguments.first().ok_or("missing managed executable")?)
-    }
-    pub fn validate_launcher(&self) -> Result<(), Error> {
-        self.validate()?;
-        validate_executable(&self.launcher)?;
-        for path in &self.entrypoints {
-            if Path::new(path).try_exists()? {
-                validate_executable(path)?;
-            }
-        }
-        Ok(())
-    }
-}
-fn validate_executable(path: &str) -> Result<(), Error> {
-    use std::path::Component;
-    if Path::new(path)
-        .components()
-        .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
-    {
-        return Err("trusted executable path must not contain dot components".into());
-    }
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.is_file()
-        || metadata.uid() != 0
-        || metadata.mode() & 0o6022 != 0
-        || metadata.mode() & 0o111 == 0
-    {
-        return Err(
-            "trusted executable must be root-owned, executable, non-writable and non-setid".into(),
-        );
-    }
-    for ancestor in Path::new(path).ancestors().skip(1) {
-        let metadata = std::fs::symlink_metadata(ancestor)?;
-        if !metadata.is_dir()
-            || metadata.uid() != 0
-            || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
-        {
-            return Err("trusted executable has an unsafe ancestor".into());
-        }
-    }
-    Ok(())
 }
 pub fn allowed_environment(value: &str) -> bool {
     let Some((key, value)) = value.split_once('=') else {

@@ -1,4 +1,4 @@
-//! Single-threaded, post-exec PAM worker and final trusted launcher boundary.
+//! Single-threaded, post-exec PAM worker and session authority delivery.
 use super::worker::{SessionChildToParent, SessionClass};
 use crate::{
     error::Error,
@@ -29,7 +29,7 @@ pub fn terminated() -> bool {
 }
 
 pub fn prepare(settings: &Settings, socket: &UnixDatagram) -> Result<(), Error> {
-    settings.validate_launcher()?;
+    settings.validate()?;
     launch::null_standard_streams()?;
     launch::detach_worker()?;
     // No runtime has been created in this exec'd worker. The IPC socket is its
@@ -222,7 +222,6 @@ pub fn run(
 ) -> Result<(), Error> {
     let socket = host.socket;
     let arguments = settings.arguments(&command)?;
-    settings.validate_command(&arguments)?;
     if environment.len() > 256 {
         return Err("too many session environment variables".into());
     }

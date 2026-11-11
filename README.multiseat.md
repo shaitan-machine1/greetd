@@ -11,10 +11,8 @@ service = "greetd"
 seat = "seat0"
 vt = 7
 run_directory = "/run/greetd-seat0"
-launcher = "/usr/libexec/multiseatd/seat-launch"
-trusted_entrypoints = "/usr/bin/sglogin-weston"
 [default_session]
-command = "/usr/libexec/multiseatd/seat-launch /usr/bin/cage -- /usr/bin/regreet"
+command = "/usr/bin/cage -- /usr/bin/regreet"
 user = "greeter"
 service = "greetd-greeter"
 ```
@@ -57,21 +55,26 @@ scheduling on worker loss preserves the existing session boundary.
 Each controller supports one authenticated user compositor, then a fresh greeter.
 No retained-session UI, desktop supervisor or automatic cross-seat fallback exists.
 
-## Trusted exec boundary
+## Session exec boundary
 
-Only the configured launcher and explicitly trusted absolute entrypoints may
-receive full authority. Files/ancestors must be root-owned and non-writable
-(root-owned sticky temporary parents are allowed). Entrypoints must immediately
-exec seat-launch at the final compositor boundary. Never prefix them with a
-shell profile, logger, dbus-run-session or other helper inheriting authority.
+Greeter and desktop commands receive authority identically. Greetd does not
+recognize compositor wrappers, require a particular executable/path, or maintain
+a command allowlist. Commands are executed with the target user's credentials;
+normal PATH lookup is supported. Choose the command/desktop entry accordingly:
+its pre-libseat loaders/helpers receive the delegated context authority.
+
 Fork setup marks every nonstandard FD CLOEXEC before explicitly allowing the
-one authority FD; SDK/PAM/IPC descriptors do not survive exec. A native trusted
-entrypoint receives explicit `LIBSEAT_BACKEND=multiseatd` and consumes its authority
-during libseat open; pre-open loaders/helpers are trusted with full authority.
-Strict seat-launch overrides this with `seatd` and a fresh inherited endpoint.
+one authority FD; SDK/PAM/IPC descriptors do not survive exec. Every command
+receives `LIBSEAT_BACKEND=multiseatd` and `MULTISEATD_AUTHORITY_FD`. Unmodified
+Cage/Weston consume the authority through the maintained native C libseat backend.
+An entry may instead explicitly use `/usr/libexec/multiseatd/with-seat`, which
+closes full authority before compositor exec and selects `seatd` with a fresh
+inherited connection. `/usr/libexec/multiseatd/without-seat` strips inherited
+seat capabilities for commands that should not receive them. Neither wrapper
+is a greetd configuration concept.
 
-Seat-launch closes full authority before compositor exec. Cage's maintained C
-libseat consumes/unsets SEATD_FD and sets CLOEXEC before stock ReGreet exec.
+Cage's maintained C libseat consumes/unsets its bootstrap environment and sets
+connection CLOEXEC before stock ReGreet exec.
 Greeters are forced to DRM/libinput rather than an environment-selected nested
 backend. UI environment cannot select capabilities, loaders, trusted buses,
 runtime directories or backends. Ordinary applications receive neither authority
@@ -106,9 +109,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 `tests/root-managed.sh` builds as the normal user, then uses sudo only for private
 buses/PAM configuration and disposable ACL files. Supply explicit absolute
-`MULTISEATD_BINARY` (non-VT test-support build), `SEAT_LAUNCH_BINARY`,
-`LIBSEAT_SOURCE` and `LIBSEAT_BUILD`. Repeat with `GREETD_NATIVE=1` and a
-native-enabled libseat build to exercise the native launch boundary. An optional
+`MULTISEATD_BINARY` (non-VT test-support build), `WITH_SEAT_BINARY`,
+`LIBSEAT_SOURCE` and `LIBSEAT_BUILD`. Native launch is the default; repeat with
+`GREETD_NATIVE=0` to explicitly select the strict wrapper in fixture commands.
+Use a native-enabled libseat build for both modes. An optional
 explicit `GREETD_CARGO_CONFIG`
 selects caller-supplied Cargo dependency overrides. Missing prerequisites return
 77. No host PAM, cgroups, console devices or services are changed.

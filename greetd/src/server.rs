@@ -300,7 +300,7 @@ pub async fn main(mut config: Config, started: &std::cell::Cell<bool>) -> Result
         if unsafe { libc::geteuid() } != 0 {
             return Err("managed greetd must run as root".into());
         }
-        settings.validate_launcher()?;
+        settings.validate()?;
         Some(crate::managed::Owner::start()?)
     } else {
         None
