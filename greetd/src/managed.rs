@@ -1,12 +1,13 @@
-//! Explicit multiseatd integration. Blocking clients live in exec workers or
-//! this daemon-owned cleanup thread, never hidden inside a client library.
-use crate::error::Error;
-use libmultiseatd::{Client, ContextId};
+//! Trusted launch settings and generic worker supervision. Only the privileged
+//! PAM host owns multiseatd capabilities/IDs/RPCs; main has no takeover fallback.
+use crate::{error::Error, session::worker::SessionChildToParent};
 use serde::{Deserialize, Serialize};
-use std::os::fd::{AsRawFd, OwnedFd};
 use std::{
     collections::BTreeMap,
-    os::unix::fs::MetadataExt,
+    os::{
+        fd::{AsRawFd, OwnedFd},
+        unix::{fs::MetadataExt, net::UnixDatagram},
+    },
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -14,11 +15,11 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::Notify;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     pub seat: String,
+    pub vt: u32,
     pub launcher: String,
     pub entrypoints: Vec<String>,
     pub directory: String,
@@ -28,16 +29,16 @@ pub struct Settings {
     pub test_library_path: Option<String>,
 }
 impl Settings {
+    pub fn instance(&self) -> String {
+        format!("{}-vt{}", self.seat, self.vt)
+    }
+    pub fn socket_path(&self) -> String {
+        format!("{}/greetd-{}.sock", self.directory, self.instance())
+    }
     pub fn validate(&self) -> Result<(), Error> {
-        if self.seat.len() > 63
-            || !self.seat.starts_with("seat")
-            || !self
-                .seat
-                .bytes()
-                .skip(4)
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-        {
-            return Err("invalid multiseat seat name".into());
+        libmultiseatd::bus_name(&self.seat).map_err(|error| error.to_string())?;
+        if self.vt > 63 {
+            return Err("managed VT must be 0 or 1..63".into());
         }
         if self.entrypoints.len() > 16
             || self
@@ -70,7 +71,7 @@ impl Settings {
             || (argv[0] == self.launcher && argv.len() < 2)
         {
             return Err(
-                "managed sessions must begin with with-seat or an explicitly trusted entrypoint"
+                "managed sessions must begin with seat-launch or an explicitly trusted entrypoint"
                     .into(),
             );
         }
@@ -130,23 +131,35 @@ pub fn allowed_environment(value: &str) -> bool {
             || matches!(key, "XDG_CURRENT_DESKTOP" | "DESKTOP_SESSION"))
 }
 
+type Outcome = Result<(), String>;
 struct Record {
     worker: Arc<OwnedFd>,
-    context: Option<ContextId>,
+    channel: UnixDatagram,
+    watching: bool,
+    required: bool,
+    teardown: Option<Outcome>,
     session: Option<String>,
+    final_result: Option<Outcome>,
     released: bool,
-    final_metadata: bool,
     exited: bool,
-    seat_pending: bool,
-    seat_done: bool,
+    exit_drained: bool,
     session_done: bool,
-    force_session: bool,
 }
 struct Shared {
     records: Mutex<BTreeMap<i32, Record>>,
     stop: AtomicBool,
     lost: AtomicBool,
-    changed: Notify,
+    changed: tokio::sync::watch::Sender<u64>,
+}
+impl Shared {
+    fn changed(&self) {
+        self.changed
+            .send_modify(|value| *value = value.wrapping_add(1));
+    }
+    fn fail(&self) {
+        self.lost.store(true, Ordering::Release);
+        self.changed();
+    }
 }
 #[derive(Clone)]
 pub struct Backend(Arc<Shared>);
@@ -155,226 +168,261 @@ pub struct Owner {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 impl Backend {
-    pub fn track(&self, worker: Arc<OwnedFd>) -> Result<(), Error> {
+    pub fn track(&self, worker: Arc<OwnedFd>, channel: UnixDatagram) -> Result<(), Error> {
         let mut records = self.0.records.lock().unwrap();
-        if records.len() >= 64 {
-            return Err("managed cleanup admission limit reached".into());
+        if self.0.stop.load(Ordering::Acquire) || self.0.lost.load(Ordering::Acquire) {
+            return Err("worker supervisor is stopping".into());
         }
+        if records.len() >= 64 {
+            return Err("worker supervision admission limit reached".into());
+        }
+        channel.set_nonblocking(true)?;
         records.insert(
             worker.as_raw_fd(),
             Record {
                 worker,
-                context: None,
+                channel,
+                watching: false,
+                required: false,
+                teardown: None,
                 session: None,
+                final_result: None,
                 released: false,
-                final_metadata: false,
                 exited: false,
-                seat_pending: false,
-                seat_done: true,
+                exit_drained: false,
                 session_done: true,
-                force_session: false,
             },
         );
         Ok(())
     }
-    pub fn metadata(
-        &self,
-        worker: &OwnedFd,
-        context: Option<ContextId>,
-        session: Option<String>,
-    ) -> Result<(), Error> {
+    pub fn metadata(&self, worker: &OwnedFd, session: Option<String>) -> Result<(), Error> {
         let mut records = self.0.records.lock().unwrap();
         let record = records
             .get_mut(&worker.as_raw_fd())
-            .ok_or("managed worker registration lost")?;
-        if let Some(context) = context {
-            if record.context.is_some_and(|old| old != context) {
-                return Err("worker changed its registered context".into());
-            }
-            record.context = Some(context);
-            record.seat_done = false;
+            .ok_or("worker registration lost")?;
+        if record
+            .session
+            .as_ref()
+            .is_some_and(|old| Some(old) != session.as_ref())
+        {
+            return Err("worker changed its containment identity".into());
         }
-        if session.is_some() {
-            record.session = session;
-            record.session_done = false;
-        }
+        record.session_done = session.is_none();
+        record.session = session;
         Ok(())
     }
-    pub fn final_metadata(&self, worker: &OwnedFd) {
-        if let Some(record) = self.0.records.lock().unwrap().get_mut(&worker.as_raw_fd()) {
-            record.final_metadata = true;
+    pub fn require_teardown(&self, worker: &OwnedFd) -> Result<(), Error> {
+        let mut records = self.0.records.lock().unwrap();
+        let record = records
+            .get_mut(&worker.as_raw_fd())
+            .ok_or("worker registration lost")?;
+        if record.teardown.is_some() || record.exited || self.0.lost.load(Ordering::Acquire) {
+            return Err("worker is no longer eligible for Start".into());
+        }
+        record.required = true;
+        Ok(())
+    }
+    pub fn teardown(&self, worker: &OwnedFd, result: Outcome) -> Result<(), Error> {
+        let mut records = self.0.records.lock().unwrap();
+        let record = records
+            .get_mut(&worker.as_raw_fd())
+            .ok_or("worker registration lost")?;
+        if let Err(error) = apply_teardown(record, result) {
+            self.0.fail();
+            return Err(error);
+        }
+        if record.teardown.as_ref().is_some_and(Result::is_err) {
+            self.0.fail();
+        }
+        self.0.changed();
+        Ok(())
+    }
+    pub fn result(&self, worker: &OwnedFd) -> Result<Option<()>, Error> {
+        let records = self.0.records.lock().unwrap();
+        let record = records
+            .get(&worker.as_raw_fd())
+            .ok_or("worker registration lost")?;
+        match &record.teardown {
+            Some(Ok(())) => Ok(Some(())),
+            Some(Err(error)) => Err(format!("device teardown failed: {error}").into()),
+            None if record.exited && record.required => {
+                Err("worker exited without positive device teardown".into())
+            }
+            None => Ok(None),
         }
     }
-    pub fn force(&self, worker: &OwnedFd) {
+    pub fn watch(&self, worker: &OwnedFd) {
         if let Some(record) = self.0.records.lock().unwrap().get_mut(&worker.as_raw_fd()) {
-            record.seat_pending = true;
-            record.force_session = true;
-        }
-    }
-    pub fn remove(&self, worker: &OwnedFd) {
-        if let Some(record) = self.0.records.lock().unwrap().get_mut(&worker.as_raw_fd()) {
-            record.seat_pending = true;
+            record.watching = true;
         }
     }
     pub fn release(&self, worker: &OwnedFd) {
         if let Some(record) = self.0.records.lock().unwrap().get_mut(&worker.as_raw_fd()) {
-            record.seat_pending = true;
+            record.watching = true;
             record.released = true;
         }
     }
     pub fn stop_workers(&self) {
-        let workers: Vec<_> = {
-            let mut records = self.0.records.lock().unwrap();
-            records
-                .values_mut()
-                .map(|record| {
-                    record.seat_pending = true;
-                    record.worker.clone()
-                })
-                .collect()
-        };
-        for worker in workers {
-            signal(&worker, libc::SIGTERM);
+        for record in self.0.records.lock().unwrap().values() {
+            signal(&record.worker, libc::SIGTERM);
         }
+    }
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.0.changed.subscribe()
     }
     pub async fn failed(&self) {
-        loop {
-            let changed = self.0.changed.notified();
-            if self.0.lost.load(Ordering::Acquire) {
+        let mut changed = self.subscribe();
+        while !self.0.lost.load(Ordering::Acquire) {
+            if changed.changed().await.is_err() {
                 return;
             }
-            changed.await;
         }
     }
+}
+fn apply_teardown(record: &mut Record, result: Outcome) -> Result<(), Error> {
+    if record.teardown.is_some() {
+        return Err("duplicate device teardown result".into());
+    }
+    record.teardown = Some(result);
+    Ok(())
 }
 struct FailureGuard(Arc<Shared>);
 impl Drop for FailureGuard {
     fn drop(&mut self) {
         if !self.0.stop.load(Ordering::Acquire) {
-            self.0.lost.store(true, Ordering::Release);
-            self.0.changed.notify_one();
+            self.0.fail();
         }
     }
 }
 impl Owner {
-    pub fn start(settings: Settings) -> Result<Self, Error> {
+    pub fn start() -> Result<Self, Error> {
+        let (changed, _) = tokio::sync::watch::channel(0);
         let shared = Arc::new(Shared {
             records: Mutex::new(BTreeMap::new()),
             stop: AtomicBool::new(false),
             lost: AtomicBool::new(false),
-            changed: Notify::new(),
+            changed,
         });
         let backend = Backend(shared.clone());
-        let (ready, started) = std::sync::mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
-            .name("greetd-seat-cleanup".into())
+            .name("greetd-worker-supervisor".into())
             .spawn(move || {
-                let _failure = FailureGuard(shared.clone());
-                let setup = (|| -> Result<(Client, String), Error> {
-                    let client = Client::system(Duration::from_secs(2))
-                        .map_err(|error| error.to_string())?;
-                    let owner = client.owner().map_err(|error| error.to_string())?;
-                    if !client
-                        .list_seats()
-                        .map_err(|error| error.to_string())?
-                        .iter()
-                        .any(|row| row.0 == settings.seat)
-                    {
-                        return Err("configured multiseat seat is not ready".into());
-                    }
-                    Ok((client, owner))
-                })();
-                let (client, owner) = match setup {
-                    Ok(value) => {
-                        let _ = ready.send(Ok(()));
-                        value
-                    }
-                    Err(error) => {
-                        let _ = ready.send(Err(error));
-                        return;
-                    }
-                };
+                let _guard = FailureGuard(shared.clone());
                 let mut stopping = None;
-                let mut cursor = 0usize;
                 loop {
                     if shared.stop.load(Ordering::Acquire) && stopping.is_none() {
                         stopping = Some(Instant::now() + Duration::from_secs(10));
                     }
-                    if stopping.is_none() {
-                        let live = client.owner().ok().as_deref() == Some(owner.as_str())
-                            && client
-                                .list_seats()
-                                .is_ok_and(|rows| rows.iter().any(|row| row.0 == settings.seat));
-                        if !live {
-                            shared.lost.store(true, Ordering::Release);
-                            shared.changed.notify_one();
-                        }
-                    }
+                    let mut changed = false;
                     let candidate = {
                         let mut records = shared.records.lock().unwrap();
                         for record in records.values_mut() {
-                            let mut descriptor = libc::pollfd {
+                            let mut drained = false;
+                            if record.watching {
+                                let mut data = [0; 10240];
+                                for _ in 0..32 {
+                                    match record.channel.recv(&mut data) {
+                                        Ok(length) => {
+                                            match serde_json::from_slice::<SessionChildToParent>(
+                                                &data[..length],
+                                            ) {
+                                                Ok(SessionChildToParent::DeviceTeardown {
+                                                    result,
+                                                }) => {
+                                                    if apply_teardown(record, result).is_err() {
+                                                        shared.fail();
+                                                    }
+                                                }
+                                                Ok(SessionChildToParent::Finished { result }) => {
+                                                    if let Err(error)=&result {eprintln!("PAM host final result (separate from device teardown): {error}");}
+                                                    record.session_done |= result.is_ok();
+                                                    record.final_result = Some(result);
+                                                }
+                                                Ok(SessionChildToParent::Error(error)) => {
+                                                    record.final_result =
+                                                        Some(Err(error.to_string()));
+                                                }
+                                                Ok(
+                                                    SessionChildToParent::Success
+                                                    | SessionChildToParent::PamMessage { .. }
+                                                    | SessionChildToParent::FinalChildPid(_),
+                                                ) => (),
+                                                Ok(SessionChildToParent::ManagedSession {
+                                                    session,
+                                                }) => {
+                                                    if record.session.as_ref().is_some_and(|old| {
+                                                        Some(old) != session.as_ref()
+                                                    }) {
+                                                        shared.fail();
+                                                    } else {
+                                                        record.session_done = session.is_none();
+                                                        record.session = session;
+                                                    }
+                                                }
+                                                _ => shared.fail(),
+                                            }
+                                            changed = true;
+                                        }
+                                        Err(error)
+                                            if error.kind() == std::io::ErrorKind::WouldBlock =>
+                                        {
+                                            drained = true;
+                                            break;
+                                        }
+                                        Err(error)
+                                            if error.kind() == std::io::ErrorKind::Interrupted =>
+                                        {
+                                            continue
+                                        }
+                                        Err(_) => {
+                                            if !record.exited {
+                                                shared.fail();
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            record.exit_drained = record.exited && drained;
+                            let mut poll = libc::pollfd {
                                 fd: record.worker.as_raw_fd(),
                                 events: libc::POLLIN,
                                 revents: 0,
                             };
-                            if unsafe { libc::poll(&mut descriptor, 1, 0) } > 0 {
+                            if !record.exited && unsafe { libc::poll(&mut poll, 1, 0) } > 0 {
+                                // Drain final datagrams on the next iteration BEFORE
+                                // diagnosing missing proof or forgetting the record.
                                 record.exited = true;
-                                record.seat_pending = true;
+                                changed = true;
+                            } else if record.exit_drained
+                                && record.required
+                                && record.teardown.is_none()
+                            {
+                                shared.fail();
                             }
-                            if stopping.is_some() {
-                                record.seat_pending = true;
+                            if record.teardown.as_ref().is_some_and(Result::is_err) {
+                                shared.fail();
                             }
                         }
                         records.retain(|_, record| {
-                            !(record.exited
-                                && (record.released || record.final_metadata)
-                                && record.seat_done
+                            !(record.exit_drained
+                                && record.released
                                 && record.session_done)
                         });
-                        let candidates: Vec<_> = records
+                        records
                             .iter()
-                            .filter(|(_, record)| {
-                                (record.seat_pending && !record.seat_done)
-                                    || ((record.exited
-                                        || record.force_session
-                                        || stopping.is_some())
-                                        && !record.session_done)
-                            })
-                            .map(|(key, record)| {
-                                (
-                                    *key,
-                                    record.context,
-                                    record.session.clone(),
-                                    record.seat_pending && !record.seat_done,
-                                    (record.exited || record.force_session || stopping.is_some())
-                                        && !record.session_done,
-                                )
-                            })
-                            .collect();
-                        if candidates.is_empty() {
-                            None
-                        } else {
-                            let candidate = candidates[cursor % candidates.len()].clone();
-                            cursor = (cursor + 1) % 64;
-                            Some(candidate)
-                        }
+                            .find(|(_, record)| record.exited && !record.session_done)
+                            .map(|(key, record)| (*key, record.session.clone()))
                     };
-                    if let Some((key, context, session, remove, close)) = candidate {
-                        let seat_done = !remove
-                            || context.is_none_or(|id| client.remove_context_by_id(id).is_ok());
-                        let session_done = !close
-                            || session.as_ref().is_none_or(|id| {
-                                lib_sessiond::bus::Client::system(Duration::from_secs(2))
-                                    .and_then(|client| client.schedule_close_session(id))
-                                    .is_ok()
-                            });
-                        let mut records = shared.records.lock().unwrap();
-                        if let Some(record) = records.get_mut(&key) {
-                            if remove && seat_done {
-                                record.seat_done = true;
-                            }
-                            if close && session_done {
+                    if changed {
+                        shared.changed();
+                    }
+                    if let Some((key, Some(session))) = candidate {
+                        let done = lib_sessiond::bus::Client::system(Duration::from_secs(2))
+                            .and_then(|client| client.schedule_close_session(&session))
+                            .is_ok();
+                        if done {
+                            if let Some(record) = shared.records.lock().unwrap().get_mut(&key) {
                                 record.session_done = true;
                             }
                         }
@@ -385,32 +433,23 @@ impl Owner {
                             break;
                         }
                         if Instant::now() >= deadline {
+                            for record in records.values() {
+                                signal(&record.worker, libc::SIGKILL);
+                            }
                             eprintln!(
-                                "managed cleanup still pending for {} workers",
+                                "generic worker cleanup unresolved for {} workers",
                                 records.len()
                             );
                             break;
                         }
                     }
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(Duration::from_millis(20));
                 }
             })?;
-        match started
-            .recv()
-            .map_err(|error| Error::Error(error.to_string()))
-        {
-            Ok(Ok(())) => Ok(Self {
-                backend,
-                thread: Some(thread),
-            }),
-            result => {
-                let _ = thread.join();
-                Err(match result {
-                    Ok(Err(error)) | Err(error) => error,
-                    _ => unreachable!(),
-                })
-            }
-        }
+        Ok(Self {
+            backend,
+            thread: Some(thread),
+        })
     }
     pub fn backend(&self) -> Backend {
         self.backend.clone()
@@ -422,7 +461,7 @@ impl Drop for Owner {
         self.backend.0.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             if thread.join().is_err() {
-                eprintln!("managed cleanup owner panicked");
+                eprintln!("worker supervisor panicked");
             }
         }
     }
@@ -455,7 +494,6 @@ pub fn signal(worker: &OwnedFd, signal: i32) {
         );
     }
 }
-
 pub fn pidfd(pid: u32) -> Result<Arc<OwnedFd>, Error> {
     use std::os::fd::FromRawFd;
     let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
@@ -483,5 +521,98 @@ mod tests {
         }
         assert!(allowed_environment("LANG=en_US.UTF-8"));
         assert!(allowed_environment("XDG_CURRENT_DESKTOP=weston"));
+    }
+    fn until(mut ready: impl FnMut() -> bool) {
+        let end = Instant::now() + Duration::from_secs(2);
+        while !ready() {
+            assert!(Instant::now() < end, "supervision fixture did not settle");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    #[test]
+    fn final_pam_failure_never_erases_positive_device_proof() {
+        let owner = Owner::start().unwrap();
+        let backend = owner.backend();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let worker = pidfd(child.id()).unwrap();
+        let (channel, peer) = UnixDatagram::pair().unwrap();
+        backend.track(worker.clone(), channel).unwrap();
+        backend.require_teardown(&worker).unwrap();
+        backend.watch(&worker);
+        assert!(backend.result(&worker).unwrap().is_none());
+        SessionChildToParent::DeviceTeardown { result: Ok(()) }
+            .send(&peer)
+            .unwrap();
+        until(|| backend.result(&worker).unwrap().is_some());
+        SessionChildToParent::Finished {
+            result: Err("injected PAM-close failure".into()),
+        }
+        .send(&peer)
+        .unwrap();
+        until(|| {
+            backend
+                .0
+                .records
+                .lock()
+                .unwrap()
+                .get(&worker.as_raw_fd())
+                .unwrap()
+                .final_result
+                .is_some()
+        });
+        assert!(backend.result(&worker).unwrap().is_some());
+        assert!(!backend.0.lost.load(Ordering::Acquire));
+        backend.release(&worker);
+        drop(owner);
+        child.wait().unwrap();
+    }
+    #[test]
+    fn pending_and_dead_without_proof_never_authorize_start() {
+        let owner = Owner::start().unwrap();
+        let backend = owner.backend();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let worker = pidfd(child.id()).unwrap();
+        let (channel, _peer) = UnixDatagram::pair().unwrap();
+        backend.track(worker.clone(), channel).unwrap();
+        backend.require_teardown(&worker).unwrap();
+        backend.watch(&worker);
+        assert!(backend.result(&worker).unwrap().is_none());
+        signal(&worker, libc::SIGKILL);
+        child.wait().unwrap();
+        until(|| backend.0.lost.load(Ordering::Acquire));
+        assert!(backend.result(&worker).is_err());
+        assert!(backend.require_teardown(&worker).is_err());
+        backend.release(&worker);
+        drop(owner);
+    }
+    #[test]
+    fn explicit_pending_result_is_failure_not_positive_teardown() {
+        let owner = Owner::start().unwrap();
+        let backend = owner.backend();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let worker = pidfd(child.id()).unwrap();
+        let (channel, peer) = UnixDatagram::pair().unwrap();
+        backend.track(worker.clone(), channel).unwrap();
+        backend.require_teardown(&worker).unwrap();
+        backend.watch(&worker);
+        SessionChildToParent::DeviceTeardown {
+            result: Err("Pending: unfinished withdrawal".into()),
+        }
+        .send(&peer)
+        .unwrap();
+        until(|| backend.0.lost.load(Ordering::Acquire));
+        assert!(backend.result(&worker).is_err());
+        backend.release(&worker);
+        drop(owner);
+        child.wait().unwrap();
     }
 }

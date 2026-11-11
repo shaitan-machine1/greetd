@@ -1,5 +1,5 @@
 //! Single-threaded, post-exec PAM worker and final trusted launcher boundary.
-use super::worker::{ParentToSessionChild, SessionChildToParent, SessionClass};
+use super::worker::{SessionChildToParent, SessionClass};
 use crate::{
     error::Error,
     managed::{self, Settings},
@@ -38,6 +38,7 @@ pub fn prepare(settings: &Settings, socket: &UnixDatagram) -> Result<(), Error> 
         launch::close_unlisted(&[socket.as_raw_fd()])?;
     }
     socket.set_read_timeout(Some(Duration::from_millis(250)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(1)))?;
     let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
     action.sa_sigaction = terminate as *const () as usize;
     unsafe {
@@ -61,24 +62,125 @@ pub fn prepare(settings: &Settings, socket: &UnixDatagram) -> Result<(), Error> 
     Ok(())
 }
 
-struct Cleanup {
+/// Created before PAM; moved after PamSession construction for strict drop order.
+/// This privileged host alone owns the context, pinned client and immutable metadata.
+pub struct Host<'a> {
+    client: Client,
     context: Option<Context>,
+    seat: String,
+    vt: u32,
+    socket: &'a UnixDatagram,
+    reported: Option<Result<(), String>>,
     session: Option<String>,
+    activated: bool,
 }
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        if let Some(context) = &self.context {
-            if let Err(error) = Client::system(Duration::from_secs(2))
-                .and_then(|client| client.remove_context_by_id(context.id))
-            {
-                eprintln!("context cleanup pending: {}", error);
+fn rpc(error: dbus::Error) -> Error {
+    format!("{}: {error}", error.name().unwrap_or("D-Bus error")).into()
+}
+impl<'a> Host<'a> {
+    pub fn new(settings: &Settings, socket: &'a UnixDatagram) -> Result<Self, Error> {
+        let client = match &settings.system_bus {
+            Some(address) => Client::for_address(address, &settings.seat, Duration::from_secs(10)),
+            None => Client::system(&settings.seat),
+        }
+        .map_err(rpc)?;
+        let context = client.create_context(settings.vt).map_err(rpc)?;
+        let mut host = Self {
+            client,
+            context: Some(context),
+            seat: String::new(),
+            vt: 0,
+            socket,
+            reported: None,
+            session: None,
+            activated: false,
+        };
+        let (seat, vt) = host
+            .client
+            .seat_metadata(host.context.as_ref().unwrap().as_fd())
+            .map_err(rpc)?;
+        if seat != settings.seat || vt != settings.vt {
+            return Err("immutable seat/VT metadata mismatch".into());
+        }
+        host.seat = seat;
+        host.vt = vt;
+        Ok(host)
+    }
+    pub fn configure_pam(&self, pam: &mut PamSession<'_>) -> Result<(), Error> {
+        pam.set_item(
+            pam_sys::PamItemType::TTY,
+            &if self.vt == 0 {
+                String::new()
+            } else {
+                format!("tty{}", self.vt)
+            },
+        )?;
+        pam.putenv(&format!("XDG_SEAT={}", self.seat))?;
+        if self.vt != 0 {
+            pam.putenv(&format!("XDG_VTNR={}", self.vt))?;
+        } else if pam
+            .getenvlist()?
+            .to_vec()
+            .iter()
+            .any(|value| value.to_bytes().starts_with(b"XDG_VTNR="))
+        {
+            pam.putenv("XDG_VTNR")?;
+        }
+        Ok(())
+    }
+    pub fn teardown(&mut self) -> Result<(), Error> {
+        if let Some(result) = &self.reported {
+            return result.clone().map_err(Error::from);
+        }
+        let result = self.context.as_ref().map_or(Ok(()), |context| {
+            let deactivate = if self.activated {
+                self.client.deactivate_context(context.id)
+            } else {
+                Ok(())
+            };
+            let remove = self.client.remove_context_by_id(context.id);
+            match deactivate {
+                Err(error)
+                    if !matches!(
+                        error.name().and_then(libmultiseatd::ErrorKind::from_name),
+                        Some(
+                            libmultiseatd::ErrorKind::NotFound
+                                | libmultiseatd::ErrorKind::NotAuthorized
+                        )
+                    ) =>
+                {
+                    let mut text = rpc(error).to_string();
+                    if let Err(error) = remove {
+                        text.push_str(&format!("; removal: {}", rpc(error)));
+                    }
+                    Err(text)
+                }
+                _ => remove.map_err(|error| rpc(error).to_string()),
             }
+        });
+        self.reported = Some(result.clone());
+        // Explicit RESULT, including failure, precedes every PAM-close path.
+        let sent = SessionChildToParent::DeviceTeardown {
+            result: result.clone(),
+        }
+        .send(self.socket);
+        if result.is_ok() {
+            self.context.take();
+        }
+        sent?;
+        result.map_err(Error::from)
+    }
+}
+impl Drop for Host<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.teardown() {
+            eprintln!("device teardown not certified: {error}");
         }
         if let Some(session) = &self.session {
             if let Err(error) = lib_sessiond::bus::Client::system(Duration::from_secs(2))
                 .and_then(|client| client.schedule_close_session(session))
             {
-                eprintln!("session cleanup pending: {}", error);
+                eprintln!("session cleanup pending: {error}");
             }
         }
     }
@@ -110,20 +212,24 @@ impl Drop for ChildGuard {
 }
 
 pub fn run(
-    socket: &UnixDatagram,
     settings: &Settings,
     class: &SessionClass,
+    foreground: bool,
     environment: Vec<String>,
     command: Vec<String>,
     pam: &mut PamSession<'_>,
+    host: &mut Host<'_>,
 ) -> Result<(), Error> {
+    let socket = host.socket;
     let arguments = settings.arguments(&command)?;
     settings.validate_command(&arguments)?;
     if environment.len() > 256 {
         return Err("too many session environment variables".into());
     }
+    host.configure_pam(pam)?;
+    pam.setcred(PamFlag::ESTABLISH_CRED)?;
     let mut user = nix::unistd::User::from_name(&pam.get_user()?)?.ok_or("PAM user is unknown")?;
-    let initial_user = user.name.clone();
+    let initial_user = (user.name.clone(), user.uid);
     for value in environment
         .iter()
         .filter(|value| managed::allowed_environment(value))
@@ -131,7 +237,6 @@ pub fn run(
         pam.putenv(value)?;
     }
     for value in [
-        format!("XDG_SEAT={}", settings.seat),
         "XDG_SESSION_TYPE=wayland".into(),
         format!("XDG_SESSION_CLASS={}", class.as_str()),
         format!("USER={}", user.name),
@@ -141,12 +246,12 @@ pub fn run(
     ] {
         pam.putenv(&value)?;
     }
+    host.configure_pam(pam)?;
     if let Err(error) = pam.open_session(PamFlag::NONE) {
         // Resolve only actual enclosing containment, not untrusted environment.
         // Never close a pre-existing caller session on a failed PAM open.
         if let Ok(Some(session)) = managed::session_identity(settings) {
-            let _ = lib_sessiond::bus::Client::system(Duration::from_secs(2))
-                .and_then(|client| client.schedule_close_session(&session));
+            host.session = Some(session);
         }
         return Err(error.into());
     }
@@ -154,48 +259,28 @@ pub fn run(
     if settings.test_pam_dir.is_none() && session.is_none() {
         return Err("system-login did not establish managed session containment".into());
     }
+    host.session = session;
     SessionChildToParent::ManagedSession {
-        session: session.clone(),
+        session: host.session.clone(),
     }
     .send(socket)?;
-    let mut cleanup = Cleanup {
-        context: None,
-        session,
-    };
     user = nix::unistd::User::from_name(&pam.get_user()?)?.ok_or("final PAM user is unknown")?;
-    if user.name != initial_user {
+    if (user.name.clone(), user.uid) != initial_user {
         return Err("PAM identity changed during open_session".into());
     }
     if terminated() {
         return Err("session launch cancelled".into());
     }
-    let client = Client::system(Duration::from_secs(11)).map_err(|error| error.to_string())?;
-    cleanup.context = Some(
-        client
-            .create_context(&settings.seat)
-            .map_err(|error| error.to_string())?,
-    );
-    let context = cleanup.context.as_ref().expect("created context");
-    SessionChildToParent::ManagedContext {
-        context: context.id.to_string(),
-        session: cleanup.session.clone(),
+    let context = host.context.as_ref().expect("pre-PAM context");
+    host.client
+        .add_acl_grant(context.as_fd(), user.uid.as_raw())
+        .map_err(rpc)?;
+    host.client.activate_context(context.id).map_err(rpc)?;
+    host.activated = true;
+    if foreground && matches!(class, SessionClass::Greeter) && host.vt != 0 {
+        host.client.move_to_foreground(context.id).map_err(rpc)?;
     }
-    .send(socket)?;
-    let mut buffer = [0; 10240];
-    match ParentToSessionChild::recv(socket, &mut buffer)? {
-        ParentToSessionChild::ManagedAcknowledged => (),
-        _ => return Err("managed registration was not acknowledged".into()),
-    }
-    client
-        .grant_access(context.as_fd(), user.uid.as_raw())
-        .map_err(|error| error.to_string())?;
-    client
-        .activate_context(context.as_fd())
-        .map_err(|error| error.to_string())?;
-    let (seat, terminal) = client
-        .seat_metadata(context.as_fd())
-        .map_err(|error| error.to_string())?;
-    drop(client);
+    let (seat, terminal) = (host.seat.clone(), host.vt);
     let list = pam.getenvlist()?;
     let mut env = BTreeMap::new();
     for value in list.to_vec() {
@@ -238,6 +323,7 @@ pub fn run(
             env.insert(key.to_string(), value.to_string());
         }
     }
+    env.insert("LIBSEAT_BACKEND".into(), "multiseatd".into());
     env.insert("XDG_SEAT".into(), seat);
     env.insert("XDG_SESSION_TYPE".into(), "wayland".into());
     env.insert("USER".into(), user.name.clone());
@@ -268,10 +354,7 @@ pub fn run(
         // Never let greeter environment select nested/headless backends which
         // would bypass libseat consumption before Cage execs stock ReGreet.
         env.insert("WLR_BACKENDS".into(), "drm,libinput".into());
-        env.insert(
-            "GREETD_SOCK".into(),
-            format!("{}/greetd.sock", settings.directory),
-        );
+        env.insert("GREETD_SOCK".into(), settings.socket_path());
     }
     if cfg!(feature = "test-support") {
         if let Some(path) = &settings.test_preload {
@@ -298,11 +381,17 @@ pub fn run(
     // async-signal-safe setup syscalls run in this callback, then immediate exec.
     unsafe {
         process.pre_exec(move || {
-            if libc::setsid() < 0
+            if libc::syscall(
+                libc::SYS_close_range,
+                3u32,
+                u32::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            ) < 0
+                || libc::setsid() < 0
                 || libc::setgroups(groups.len(), groups.as_ptr()) < 0
                 || libc::setgid(gid) < 0
                 || libc::setuid(uid) < 0
-                || libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) < 0
+                || libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0
                 || libc::getppid() != parent
                 || libc::chdir(directory.as_ptr()) < 0
                 || libc::fcntl(raw, libc::F_SETFD, 0) < 0
@@ -315,9 +404,18 @@ pub fn run(
     let mut child = ChildGuard(process.spawn()?);
     SessionChildToParent::FinalChildPid(u64::from(child.id())).send(socket)?;
     let mut termination = None;
+    let mut health = std::time::Instant::now();
+    let mut dependency_error = None;
     loop {
         if child.try_wait()?.is_some() {
             break;
+        }
+        if std::time::Instant::now() >= health {
+            if let Err(error) = host.client.verify_owner() {
+                dependency_error = Some(rpc(error));
+                TERMINATED.store(true, Ordering::Relaxed);
+            }
+            health = std::time::Instant::now() + Duration::from_secs(1);
         }
         if terminated() {
             if termination.is_none() {
@@ -333,15 +431,15 @@ pub fn run(
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    // Remove access before PAM schedules containment teardown. Parent cleanup
-    // independently retains the IDs and handles worker loss through its pidfd.
-    if let Some(context) = cleanup.context.take() {
-        let _ = Client::system(Duration::from_secs(2))
-            .and_then(|client| client.remove_context_by_id(context.id));
-    }
+    // Positive proof, not worker exit/Pending, authorizes a successor. PAM's
+    // final result remains separate and may arrive after the next normal Start.
+    host.teardown()?;
     pam.close_session(PamFlag::NONE)?;
     pam.setcred(PamFlag::DELETE_CRED)?;
     pam.end()?;
-    cleanup.session = None;
+    host.session = None;
+    if let Some(error) = dependency_error {
+        return Err(error);
+    }
     Ok(())
 }

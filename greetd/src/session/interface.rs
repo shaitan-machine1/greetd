@@ -1,4 +1,5 @@
 use std::{
+    convert::TryFrom,
     os::fd::OwnedFd,
     os::unix::process::CommandExt,
     os::unix::{io::AsRawFd, net::UnixDatagram},
@@ -68,10 +69,16 @@ impl SessionChild {
         self.task == pid
     }
 
+    pub fn device_result(&self) -> Result<Option<()>, Error> {
+        match &self.managed {
+            Some((backend, worker)) => backend.result(worker),
+            None => Ok(None),
+        }
+    }
+
     /// Send SIGTERM to the session child.
     pub fn term(&self) {
-        if let Some((backend, worker)) = &self.managed {
-            backend.remove(worker);
+        if let Some((_, worker)) = &self.managed {
             crate::managed::signal(worker, libc::SIGTERM);
         } else {
             let _ = nix::sys::signal::kill(self.sub_task, Signal::SIGTERM);
@@ -80,8 +87,7 @@ impl SessionChild {
 
     /// Send SIGKILL to the session child.
     pub fn kill(&self) {
-        if let Some((backend, worker)) = &self.managed {
-            backend.force(worker);
+        if let Some((_, worker)) = &self.managed {
             crate::managed::signal(worker, libc::SIGTERM);
         } else {
             let _ = nix::sys::signal::kill(self.sub_task, Signal::SIGKILL);
@@ -134,6 +140,7 @@ impl Session {
             UnixDatagram::pair().map_err(|e| format!("could not create pipe: {}", e))?;
 
         parentfd.set_nonblocking(true)?;
+        let watched_channel = parentfd.try_clone()?;
         let parentfd = TokioUnixDatagram::from_std(parentfd)?;
         let raw_child = childfd.as_raw_fd();
         let mut process = std::process::Command::new(std::env::current_exe()?);
@@ -159,7 +166,7 @@ impl Session {
             let descriptor = crate::managed::pidfd(child.as_raw() as u32).inspect_err(|_| {
                 let _ = nix::sys::signal::kill(child, Signal::SIGTERM);
             })?;
-            if let Err(error) = backend.track(descriptor.clone()) {
+            if let Err(error) = backend.track(descriptor.clone(), watched_channel) {
                 crate::managed::signal(&descriptor, libc::SIGTERM);
                 return Err(error);
             }
@@ -176,7 +183,7 @@ impl Session {
         })
     }
 
-    async fn receive(&mut self) -> Result<SessionChildToParent, Error> {
+    async fn receive_one(&mut self) -> Result<SessionChildToParent, Error> {
         if let Some((_, worker)) = &self.managed {
             let descriptor = worker.try_clone()?;
             let watched = unsafe { tokio::io::unix::AsyncFd::register(descriptor) }
@@ -195,6 +202,30 @@ impl Session {
             }
         } else {
             SessionChildToParent::recv(&mut self.sock).await
+        }
+    }
+
+    async fn receive(&mut self) -> Result<SessionChildToParent, Error> {
+        loop {
+            let message = self.receive_one().await?;
+            match message {
+                SessionChildToParent::ManagedSession { session } => {
+                    let (backend, worker) = self
+                        .managed
+                        .as_ref()
+                        .ok_or("unexpected containment metadata")?;
+                    backend.metadata(worker, session)?;
+                }
+                SessionChildToParent::DeviceTeardown { result } => {
+                    let (backend, worker) =
+                        self.managed.as_ref().ok_or("unexpected device result")?;
+                    backend.teardown(worker, result)?;
+                }
+                SessionChildToParent::Finished { .. } => {
+                    return Err("worker finished without the expected protocol response".into())
+                }
+                message => return Ok(message),
+            }
         }
     }
 
@@ -229,8 +260,7 @@ impl Session {
     /// Cancel the session.
     pub async fn cancel(&mut self) -> Result<(), Error> {
         self.last_msg = None;
-        if let Some((backend, worker)) = &self.managed {
-            backend.remove(worker);
+        if let Some((_, worker)) = &self.managed {
             crate::managed::signal(worker, libc::SIGTERM);
             return Ok(());
         }
@@ -278,33 +308,22 @@ impl Session {
     /// Start the session.
     ///
     pub async fn start(&mut self) -> Result<SessionChild, Error> {
+        if let Some((backend, worker)) = &self.managed {
+            backend.require_teardown(worker)?;
+        }
         let msg = ParentToSessionChild::Start;
         msg.send(&mut self.sock).await?;
 
         let sub_task = loop {
             match self.receive().await? {
                 SessionChildToParent::Error(e) => return Err(e),
-                SessionChildToParent::ManagedSession { session } => {
-                    let (backend, worker) =
-                        self.managed.as_ref().ok_or("unexpected managed metadata")?;
-                    backend.metadata(worker, None, session)?;
-                }
-                SessionChildToParent::ManagedContext { context, session } => {
-                    let (backend, worker) =
-                        self.managed.as_ref().ok_or("unexpected managed context")?;
-                    let context = context
-                        .parse::<libmultiseatd::ContextId>()
-                        .map_err(|error| error.to_string())?;
-                    backend.metadata(worker, Some(context), session)?;
-                    ParentToSessionChild::ManagedAcknowledged
-                        .send(&mut self.sock)
-                        .await?;
-                }
                 SessionChildToParent::FinalChildPid(raw_pid) => {
-                    if let Some((backend, worker)) = &self.managed {
-                        backend.final_metadata(worker);
-                    }
-                    break Pid::from_raw(raw_pid as i32);
+                    break Pid::from_raw(
+                        i32::try_from(raw_pid)
+                            .ok()
+                            .filter(|pid| *pid > 0)
+                            .ok_or("invalid child PID")?,
+                    );
                 }
                 SessionChildToParent::PamMessage { .. } => {
                     // pam_conv after start, ignore
@@ -320,7 +339,11 @@ impl Session {
             };
         };
 
-        self.sock.shutdown(std::net::Shutdown::Both)?;
+        if let Some((backend, worker)) = &self.managed {
+            backend.watch(worker);
+        } else {
+            self.sock.shutdown(std::net::Shutdown::Both)?;
+        }
 
         self.started = true;
         Ok(SessionChild {

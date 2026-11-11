@@ -14,7 +14,8 @@ def rows():
     except FileNotFoundError: return []
 def count(role, seat): return sum(row[0] == role and row[5] == seat for row in rows())
 wait(lambda: count('greeter', 'seat-test') >= 1 and count('greeter', 'seat-other') >= 1, 'independent greeters did not launch')
-peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); peer.settimeout(20); peer.connect(work + '/seat-test/greetd.sock')
+initial_greeter = next(row for row in rows() if row[0] == 'greeter' and row[5] == 'seat-test')
+peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); peer.settimeout(20); peer.connect(work + '/seat-test/greetd-seat-test-vt0.sock')
 def exact(length):
     result = b''
     while len(result) < length:
@@ -37,11 +38,18 @@ assert authenticate('fixture-password')['type'] == 'success'
 reply = request({'type':'start_session','cmd':['/bin/sh','-c','exit 0']})
 assert reply['type'] == 'error', reply
 assert authenticate('fixture-password')['type'] == 'success'
-reply = request({'type':'start_session', 'cmd':[work+'/with-seat',work+'/seat-client','user',work+'/apps.log',work+'/direct'],
+launch = [] if os.environ.get('GREETD_NATIVE') == '1' else [work+'/seat-launch']
+reply = request({'type':'start_session', 'cmd':launch+[work+'/seat-client','user',work+'/apps.log',work+'/fixtures/seat-test/direct'],
                  'env':['XDG_SEAT=seat-spoofed','XDG_VTNR=63','XDG_RUNTIME_DIR=/bad','LD_PRELOAD=/bad.so','DBUS_SYSTEM_BUS_ADDRESS=unix:path=/bad','MULTISEATD_AUTHORITY_FD=2','WLR_BACKENDS=headless']})
 assert reply['type'] == 'success', reply
 peer.close()
 wait(lambda: count('user','seat-test') >= 1, 'authenticated managed user did not launch')
+# The old privileged host is deliberately inside its two-second PAM close.
+# Positive device proof, NOT full worker exit, authorized this normal Start.
+os.kill(int(initial_greeter[2]), 0)
+with open(work+'/pam.log') as stream: overlap = [line.split() for line in stream]
+assert any(row[0] == 'close-enter' and row[1] == initial_greeter[2] for row in overlap), overlap
+assert not any(row[0] == 'close' and row[1] == initial_greeter[2] for row in overlap), 'handoff waited for final PAM/worker exit'
 wait(lambda: count('greeter','seat-test') >= 2, 'logout did not launch a fresh greeter')
 assert count('greeter','seat-other') == 1, 'unrelated seat was restarted'
 entries = rows()
@@ -52,6 +60,8 @@ for row in entries:
 with open(work+'/pam.log') as stream: pam = [line.split() for line in stream]
 opened = [line for line in pam if line[0] == 'open']
 assert len({line[1] for line in opened}) == len(opened), 'PAM opened twice in a worker'
-assert all(line[2] == '0' and line[3] == 'nobody' and line[5] == '1' for line in opened), opened
+assert all(line[2] == '0' and line[3] == 'nobody' and line[5] == '1' and line[6:] == ['-', '-'] for line in opened), opened
+auth = [line for line in pam if line[0] == 'auth']
+assert auth and all(line[4] == 'seat-test' and line[6:] == ['-', '-'] for line in auth), auth
 assert all(row[2] in {line[1] for line in opened} for row in entries), (entries, opened)
-print('Managed authentication, final PAM identity, detached workers, fresh connections and independent-seat logout passed')
+print('Verified pre-auth metadata, final UID, detached workers, positive pre-PAM-close handoff and independent-seat logout passed')

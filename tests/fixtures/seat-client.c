@@ -14,8 +14,10 @@
 static void enable(struct libseat *seat, void *data) { (void)seat; *(int *)data = 1; }
 static void disable(struct libseat *seat, void *data) { (void)data; libseat_disable_seat(seat); }
 int main(int argc, char **argv) {
-    if (argc != 4 || geteuid() == 0 || getenv("MULTISEATD_AUTHORITY_FD") || getenv("LD_PRELOAD")) return 1;
-    const char *raw = getenv("SEATD_FD"), *name = getenv("XDG_SEAT"), *runtime = getenv("XDG_RUNTIME_DIR");
+    const char *backend = getenv("LIBSEAT_BACKEND");
+    int native = backend && !strcmp(backend, "multiseatd");
+    if (argc != 4 || geteuid() == 0 || (!native && getenv("MULTISEATD_AUTHORITY_FD")) || getenv("LD_PRELOAD")) return 1;
+    const char *raw = getenv(native ? "MULTISEATD_AUTHORITY_FD" : "SEATD_FD"), *name = getenv("XDG_SEAT"), *runtime = getenv("XDG_RUNTIME_DIR");
     if (!raw || !name || !runtime || getenv("XDG_VTNR") || strcmp(getenv("LOGNAME"), "nobody")) return 2;
     int fd = atoi(raw), count = 0;
     DIR *directory = opendir("/proc/self/fd"); if (!directory) return 3;
@@ -32,7 +34,8 @@ int main(int argc, char **argv) {
     int enabled = 0;
     struct libseat_seat_listener listener = { .enable_seat = enable, .disable_seat = disable };
     struct libseat *seat = libseat_open_seat(&listener, &enabled);
-    if (!seat || getenv("SEATD_FD") || strcmp(libseat_seat_name(seat), name)) return 8;
+    if (!seat || getenv("MULTISEATD_AUTHORITY_FD") || getenv("SEATD_FD") || strcmp(libseat_seat_name(seat), name)) return 8;
+    fd = libseat_get_fd(seat);
     while (!enabled) if (libseat_dispatch(seat, 2000) < 0) return 9;
     if (fcntl(fd, F_GETFD) < 0 || !(fcntl(fd, F_GETFD) & FD_CLOEXEC)) return 10;
     FILE *trace = fopen(argv[2], "a"); if (!trace) return 11;

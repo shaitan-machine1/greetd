@@ -184,6 +184,7 @@ fn parse_config(config_str: &str) -> Result<ConfigFile, Error> {
             if !matches!(
                 *key,
                 "seat"
+                    | "vt"
                     | "launcher"
                     | "trusted_entrypoints"
                     | "run_directory"
@@ -198,7 +199,7 @@ fn parse_config(config_str: &str) -> Result<ConfigFile, Error> {
         let launcher = maybe_unquote(
             section
                 .get("launcher")
-                .unwrap_or(&"/usr/libexec/multiseatd/with-seat"),
+                .unwrap_or(&"/usr/libexec/multiseatd/seat-launch"),
         )?;
         let directory = match section.get("run_directory") {
             Some(value) => maybe_unquote(value)?,
@@ -206,6 +207,13 @@ fn parse_config(config_str: &str) -> Result<ConfigFile, Error> {
         };
         let setting = crate::managed::Settings {
             seat,
+            vt: section
+                .get("vt")
+                .map(|value| maybe_unquote(value))
+                .transpose()?
+                .unwrap_or_else(|| "0".into())
+                .parse::<u32>()
+                .map_err(|error| error.to_string())?,
             launcher,
             entrypoints: match section.get("trusted_entrypoints") {
                 Some(value) => shlex::split(&maybe_unquote(value)?)
@@ -237,13 +245,7 @@ fn parse_config(config_str: &str) -> Result<ConfigFile, Error> {
             return Err("source_profile is forbidden before the trusted managed launcher".into());
         }
         general.source_profile = false;
-        if config
-            .get("general")
-            .and_then(|section| section.get("runfile"))
-            .is_none()
-        {
-            general.runfile = format!("{}/started", setting.directory);
-        }
+        general.runfile = format!("{}/started-{}", setting.directory, setting.instance());
         general.multiseat = Some(setting);
     }
 
@@ -284,7 +286,13 @@ pub fn read_config() -> Result<Config, Error> {
     opts.optflag("h", "help", "print this help menu");
     opts.optopt("s", "socket-path", "socket path to use", "SOCKET_PATH");
     opts.optopt("c", "config", "config file to use", "CONFIG_FILE");
-    opts.optopt("", "vt", "use the specified vt", "VT");
+    opts.optopt(
+        "",
+        "vt",
+        "immutable managed binding, or unmanaged terminal",
+        "VT",
+    );
+    opts.optopt("", "seat", "explicit managed seat", "SEAT");
     opts.optopt(
         "",
         "worker-parent",
@@ -331,12 +339,23 @@ pub fn read_config() -> Result<Config, Error> {
     }?;
     let mut file = parse_config(&config_str)?;
 
-    if let Some(vt) = matches.opt_str("vt") {
-        if file.general.multiseat.is_some() {
-            return Err("--vt is incompatible with multiseatd".into());
+    if let Some(settings) = &mut file.general.multiseat {
+        if let Some(seat) = matches.opt_str("seat") {
+            settings.seat = seat;
         }
-        file.terminal.vt = vt.parse()?
-    };
+        if let Some(vt) = matches.opt_str("vt") {
+            settings.vt = vt.parse::<u32>().map_err(|error| error.to_string())?;
+        }
+        settings.validate()?;
+        file.general.runfile = format!("{}/started-{}", settings.directory, settings.instance());
+    } else {
+        if matches.opt_present("seat") {
+            return Err("--seat requires explicit managed configuration".into());
+        }
+        if let Some(vt) = matches.opt_str("vt") {
+            file.terminal.vt = vt.parse()?;
+        }
+    }
 
     if file.default_session.command.is_empty() {
         return Err(Error::ConfigError(
@@ -554,13 +573,21 @@ vt = current
 
     #[test]
     fn managed_config_disables_terminal_and_profiles_and_bounds_delegation() {
-        let base = "[default_session]\ncommand = \"/usr/libexec/multiseatd/with-seat /usr/bin/cage -- /usr/bin/regreet\"\n[multiseat]\nseat = \"seat-test\"\ntrusted_entrypoints = \"/usr/bin/sglogin-weston\"\n";
+        let base = "[default_session]\ncommand = \"/usr/libexec/multiseatd/seat-launch /usr/bin/cage -- /usr/bin/regreet\"\n[multiseat]\nseat = \"seat-test\"\ntrusted_entrypoints = \"/usr/bin/sglogin-weston\"\n";
         let config = parse_config(base).unwrap();
         assert_eq!(config.terminal.vt, VtSelection::None);
         assert!(!config.terminal.switch);
         assert!(!config.general.source_profile);
         let settings = config.general.multiseat.unwrap();
         assert_eq!(settings.directory, "/run/greetd-seat-test");
+        assert_eq!(settings.vt, 0);
+        let mut a = settings.clone();
+        a.vt = 7;
+        let mut b = settings.clone();
+        b.vt = 8;
+        assert_ne!(a.instance(), b.instance());
+        assert_ne!(a.socket_path(), b.socket_path());
+        assert!(parse_config(&format!("{base}vt = 64\n")).is_err());
         assert!(settings
             .arguments(&["/usr/bin/sglogin-weston".into()])
             .is_ok());

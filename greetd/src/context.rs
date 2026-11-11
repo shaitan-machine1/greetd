@@ -52,6 +52,7 @@ pub struct Context {
     runfile: String,
     listener_path: String,
     backend: Option<crate::managed::Backend>,
+    initial_greeter_started: std::cell::Cell<bool>,
 }
 
 impl Context {
@@ -76,6 +77,7 @@ impl Context {
             runfile: config.general.runfile,
             listener_path,
             backend,
+            initial_greeter_started: std::cell::Cell::new(false),
         }
     }
 
@@ -92,6 +94,8 @@ impl Context {
         if let TerminalMode::Managed(settings) = &self.term_mode {
             settings.arguments(&cmd)?;
         }
+        let foreground =
+            matches!(class, SessionClass::Greeter) && !self.initial_greeter_started.replace(true);
         let mut scheduled_session = Session::new_external(self.backend.clone())?;
         scheduled_session
             .initiate(ParentToSessionChild::InitiateLogin {
@@ -99,6 +103,7 @@ impl Context {
                 class,
                 user,
                 authenticate: false,
+                foreground,
                 tty: self.term_mode.clone(),
                 source_profile: self.source_profile,
                 listener_path: &self.listener_path,
@@ -215,6 +220,7 @@ impl Context {
                 class: SessionClass::User,
                 user: &username,
                 authenticate: true,
+                foreground: false,
                 tty: self.term_mode.clone(),
                 source_profile: self.source_profile,
                 listener_path: &self.listener_path,
@@ -315,8 +321,62 @@ impl Context {
         }
     }
 
+    /// Only an explicit positive device result authorizes normal handoff.
+    /// PAM close/final worker exit are independent, possibly much later events.
+    pub async fn check_workers(&self) -> Result<(), Error> {
+        if self.backend.is_none() {
+            return Ok(());
+        }
+        let mut inner = self.inner.write().await;
+        let ready = match &inner.current {
+            Some(current) => current.child.device_result()?.is_some(),
+            None => false,
+        };
+        if !ready {
+            return Ok(());
+        }
+        let previous = inner.current.take().expect("completed current worker");
+        let elapsed = previous.time.elapsed();
+        drop(previous);
+        if let Some(mut scheduled) = inner.scheduled.take() {
+            drop(inner);
+            let child = tokio::time::timeout(Duration::from_secs(60), scheduled.session.start())
+                .await
+                .map_err(|_| Error::Error("session startup deadline exceeded".into()))??;
+            self.inner.write().await.current = Some(SessionChildSet {
+                child,
+                time: Instant::now(),
+                is_greeter: false,
+            });
+        } else {
+            if let Some(mut configuring) = inner.configuring.take() {
+                configuring.session.cancel().await?;
+            }
+            if elapsed < Duration::from_secs(1) {
+                sleep(Duration::from_secs(1)).await;
+            }
+            inner.current = Some(SessionChildSet {
+                child: self.start_greeter().await?,
+                time: Instant::now(),
+                is_greeter: true,
+            });
+        }
+        Ok(())
+    }
+
     /// Notify the Context of an alarm.
     pub async fn alarm(&self) -> Result<(), Error> {
+        if self.backend.is_some() {
+            self.check_workers().await?;
+            let inner = self.inner.read().await;
+            if inner.scheduled.is_some() {
+                if let Some(current) = &inner.current {
+                    current.child.term();
+                }
+                alarm::set(1);
+            }
+            return Ok(());
+        }
         // Keep trying to terminate the greeter until it gives up.
         let mut inner = self.inner.write().await;
 
@@ -363,6 +423,10 @@ impl Context {
 
                 // We got an exit, see if it's something we need to clean up.
                 Ok(WaitStatus::Exited(pid, ..)) | Ok(WaitStatus::Signaled(pid, ..)) => {
+                    if self.backend.is_some() {
+                        self.check_workers().await?;
+                        continue;
+                    }
                     let mut inner = self.inner.write().await;
                     let (was_greeter, sesion_length) = match &inner.current {
                         Some(s) if s.child.owns_pid(pid) => {

@@ -115,7 +115,7 @@ async fn client_handler(ctx: &Context, mut s: UnixStream) -> Result<(), Error> {
 // If the target is VtSelection::None, return nothing.
 fn get_tty(config: &Config) -> Result<TerminalMode, Error> {
     if let Some(settings) = &config.file.general.multiseat {
-        return Ok(TerminalMode::Managed(settings.clone()));
+        return Ok(TerminalMode::Managed(Box::new(settings.clone())));
     }
     const TTY_PREFIX: &str = "/dev/tty";
     const PTS_PREFIX: &str = "/dev/pts";
@@ -190,10 +190,17 @@ impl Listener {
     ) -> Result<(String, Listener), Error> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
         let (path, lock) = if let Some(settings) = settings {
+            let created = !Path::new(&settings.directory).try_exists()?;
             std::fs::create_dir_all(&settings.directory)?;
             let metadata = std::fs::symlink_metadata(&settings.directory)?;
             if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
                 return Err("managed run directory must be root-owned and non-writable".into());
+            }
+            if created {
+                std::fs::set_permissions(
+                    &settings.directory,
+                    std::fs::Permissions::from_mode(0o755),
+                )?;
             }
             let lock = std::fs::OpenOptions::new()
                 .read(true)
@@ -201,12 +208,24 @@ impl Listener {
                 .create(true)
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(format!("{}/controller.lock", settings.directory))?;
+                .open(format!(
+                    "{}/controller-{}.lock",
+                    settings.directory,
+                    settings.instance()
+                ))?;
+            let metadata = lock.metadata()?;
+            if !metadata.is_file()
+                || metadata.uid() != 0
+                || metadata.nlink() != 1
+                || metadata.mode() & 0o022 != 0
+            {
+                return Err("unsafe managed instance lock inode".into());
+            }
             use std::os::fd::AsRawFd;
             if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
                 return Err("another greetd owns this managed instance".into());
             }
-            (format!("{}/greetd.sock", settings.directory), Some(lock))
+            (settings.socket_path(), Some(lock))
         } else {
             (format!("/run/greetd-{}.sock", getpid().as_raw()), None)
         };
@@ -233,6 +252,14 @@ impl Drop for Listener {
     }
 }
 
+async fn worker_activity(activity: &mut Option<tokio::sync::watch::Receiver<u64>>) {
+    match activity {
+        Some(changed) => {
+            let _ = changed.changed().await;
+        }
+        None => std::future::pending().await,
+    }
+}
 async fn backend_failed(backend: Option<&crate::managed::Backend>) {
     match backend {
         Some(backend) => backend.failed().await,
@@ -270,11 +297,12 @@ pub async fn main(mut config: Config) -> Result<(), Error> {
             return Err("managed greetd must run as root".into());
         }
         settings.validate_launcher()?;
-        Some(crate::managed::Owner::start(settings.clone())?)
+        Some(crate::managed::Owner::start()?)
     } else {
         None
     };
     let backend = owner.as_ref().map(crate::managed::Owner::backend);
+    let mut activity = backend.as_ref().map(crate::managed::Backend::subscribe);
 
     let u = nix::unistd::User::from_name(&config.file.default_session.user)?.ok_or(format!(
         "configured default session user '{}' not found",
@@ -323,7 +351,8 @@ pub async fn main(mut config: Config) -> Result<(), Error> {
     let clients = std::sync::Arc::new(tokio::sync::Semaphore::new(32));
     loop {
         tokio::select! {
-            _ = backend_failed(backend.as_ref()) => { if let Some(backend) = &backend { backend.stop_workers(); } ctx.terminate().await?; return Err("multiseatd owner or configured seat was lost".into()); }
+            _ = worker_activity(&mut activity) => ctx.check_workers().await?,
+            _ = backend_failed(backend.as_ref()) => { if let Some(backend) = &backend { backend.stop_workers(); } ctx.terminate().await?; return Err("worker lifetime/device teardown failed; successor Start is not authorized".into()); }
             _ = child.recv() => ctx.check_children().await.map_err(|e| format!("check_children: {}", e))?,
             _ = alarm.recv() => ctx.alarm().await.map_err(|e| format!("alarm: {}", e))?,
             _ = term.recv() => {

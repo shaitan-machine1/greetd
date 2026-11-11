@@ -9,6 +9,7 @@
 #include <string.h>
 #include <dirent.h>
 #include <errno.h>
+#include <time.h>
 
 static const char *option(int argc, const char **argv, const char *key) {
     size_t length = strlen(key);
@@ -25,11 +26,14 @@ static int trace(pam_handle_t *pamh, int argc, const char **argv, const char *ev
     if (!directory) { fclose(file); return PAM_SESSION_ERR; }
     struct dirent *entry; while ((entry = readdir(directory))) if (entry->d_name[0] != '.') ++tasks;
     closedir(directory);
-    fprintf(file, "%s %ld %ld %s %s %d\n", event, (long)getpid(), (long)geteuid(), user, seat ? seat : "-", tasks);
+    const char *vt = pam_getenv(pamh, "XDG_VTNR");
+    const void *tty = NULL; if (pam_get_item(pamh, PAM_TTY, &tty) != PAM_SUCCESS) {fclose(file); return PAM_SESSION_ERR;}
+    fprintf(file, "%s %ld %ld %s %s %d %s %s\n", event, (long)getpid(), (long)geteuid(), user, seat ? seat : "-", tasks, vt ? vt : "-", tty && *(const char *)tty ? (const char *)tty : "-");
     fclose(file); return PAM_SUCCESS;
 }
 PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
     (void)flags;
+    if (trace(pamh, argc, argv, "auth") != PAM_SUCCESS) return PAM_AUTH_ERR;
     char *response = NULL;
     int status = pam_prompt(pamh, PAM_PROMPT_ECHO_OFF, &response, "%s", "Fixture password:");
     if (status != PAM_SUCCESS) return status;
@@ -56,5 +60,10 @@ PAM_EXTERN int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, cons
     return trace(pamh, argc, argv, "open");
 }
 PAM_EXTERN int pam_sm_close_session(pam_handle_t *pamh, int flags, int argc, const char **argv) {
-    (void)flags; return trace(pamh, argc, argv, "close");
+    (void)flags;
+    if (trace(pamh, argc, argv, "close-enter") != PAM_SUCCESS) return PAM_SESSION_ERR;
+    struct timespec delay = {.tv_sec = 2, .tv_nsec = 0};
+    while (nanosleep(&delay, &delay) < 0 && errno == EINTR) {}
+    int result = trace(pamh, argc, argv, "close");
+    return option(argc, argv, "close_fail") ? PAM_SESSION_ERR : result;
 }

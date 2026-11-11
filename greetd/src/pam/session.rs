@@ -71,6 +71,10 @@ impl<'a> PamSession<'a> {
     }
 
     pub fn setcred(&mut self, flags: PamFlag) -> Result<(), PamError> {
+        // Earlier credential modules may succeed before a later module fails.
+        if flags == PamFlag::ESTABLISH_CRED {
+            self.credentials = true;
+        }
         if flags == PamFlag::DELETE_CRED {
             self.credentials = false;
         }
