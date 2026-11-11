@@ -272,7 +272,7 @@ async fn backend_failed(backend: Option<&crate::managed::Backend>) {
     }
 }
 
-pub async fn main(mut config: Config) -> Result<(), Error> {
+pub async fn main(mut config: Config, started: &std::cell::Cell<bool>) -> Result<(), Error> {
     let settings = config.file.general.multiseat.clone();
     let available = |name: &str| {
         if let Some(directory) = settings
@@ -356,6 +356,7 @@ pub async fn main(mut config: Config) -> Result<(), Error> {
     }
 
     ctx.create_runfile();
+    started.set(true);
 
     let mut alarm = signal(SignalKind::alarm()).expect("unable to listen for SIGALRM");
     let mut child = signal(SignalKind::child()).expect("unable to listen for SIGCHLD");

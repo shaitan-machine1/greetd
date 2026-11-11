@@ -343,6 +343,7 @@ impl Context {
         }
         let previous = inner.current.take().expect("completed current worker");
         let elapsed = previous.time.elapsed();
+        let was_greeter = previous.is_greeter;
         drop(previous);
         if let Some(mut scheduled) = inner.scheduled.take() {
             drop(inner);
@@ -355,6 +356,9 @@ impl Context {
                 is_greeter: false,
             });
         } else {
+            if was_greeter {
+                return Err("greeter exited without creating a session".into());
+            }
             if let Some(mut configuring) = inner.configuring.take() {
                 configuring.session.cancel().await?;
             }

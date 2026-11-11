@@ -86,6 +86,15 @@ central session include, not sessiond's internal user-manager service. Keep
 pam_env after central sessiond integration. Do not run competing runtime owners
 (pam_rundir/pam_elogind/pam_turnstile). No greetd-specific sessiond API/module exists.
 
+## Controller lifecycle
+
+Initial greeter startup failure exits one. Unexpected greeter exit without a
+scheduled user ends the controller with the upstream error, never an internal
+managed-only respawn. Ordinary top-level controller-loop errors are logged and
+return zero, as upstream does; setup/PAM-host failures still return one. External
+service supervision owns restarts. Normal user exit starts a fresh greeter, with
+the upstream one-second delay for short sessions. No GPU/background retry exists.
+
 ## Validation
 
 ```sh
@@ -106,7 +115,8 @@ selects caller-supplied Cargo dependency overrides. Missing prerequisites return
 
 The harness checks pre-auth immutable metadata/rejection, final identity, actual
 temporary-file ACLs, detached FD hygiene, two-seat isolation, positive handoff
-while old PAM close is delayed, and refusal of worker-death takeover. Generic
+while old PAM close is delayed, upstream initial/runtime/greeter-exit statuses,
+and refusal of worker-death takeover. Generic
 supervisor unit tests separately cover Pending and late final PAM failure.
 
 Optional explicit `CAGE_BINARY`/`REGREET_BINARY` exercise stock Cage 0.3.1 / wlroots

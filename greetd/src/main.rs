@@ -53,7 +53,19 @@ fn run() -> Result<(), Error> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(tokio::task::LocalSet::new().run_until(server::main(config)))
+    // Generic startup status, never a context/device policy or RPC fallback.
+    // Initial startup and exec'd PAM-host failures propagate as status one;
+    // upstream ordinary controller-loop errors log and return zero.
+    let started = std::cell::Cell::new(false);
+    if let Err(error) =
+        runtime.block_on(tokio::task::LocalSet::new().run_until(server::main(config, &started)))
+    {
+        if !started.get() {
+            return Err(error);
+        }
+        eprintln!("error: {error}");
+    }
+    Ok(())
 }
 fn main() {
     if let Err(error) = run() {

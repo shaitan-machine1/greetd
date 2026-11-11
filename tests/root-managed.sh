@@ -79,6 +79,25 @@ opened = collections.Counter(row[1] for row in rows if row[0] == 'open')
 closed = collections.Counter(row[1] for row in rows if row[0] == 'close')
 assert opened and opened == closed, (opened, closed)
 PY
+# Preserve upstream unexpected-greeter lifecycle, not managed-only respawn.
+# A successful teardown with no scheduled user exits/logs the runtime error;
+# upstream top-level controller errors return zero, unlike initial-start failure.
+baseline=$(wc -l < "$work/apps.log")
+GREETD_TEST_MODE=1 "$work/greetd" --config "$work/seat-test.conf" >"$work/greeter-exit.log" 2>&1 & first=$!
+python3 - "$work" "$baseline" <<'PY'
+import os, signal, sys, time
+path=sys.argv[1]+'/apps.log'; baseline=int(sys.argv[2])
+for _ in range(500):
+    rows=[line.split() for line in list(open(path))[baseline:] if line.startswith('greeter ')]
+    if rows: break
+    time.sleep(.02)
+else: raise AssertionError('greeter did not launch')
+os.kill(int(rows[0][1]),signal.SIGTERM)
+time.sleep(1)
+assert len(list(open(path))[baseline:])==1, 'unexpected greeter exit respawned in main'
+PY
+wait "$first"; unset first
+grep -q 'greeter exited without creating a session' "$work/greeter-exit.log"
 # Worker death without positive proof MUST NOT authorize a normal replacement.
 baseline=$(wc -l < "$work/apps.log")
 GREETD_TEST_MODE=1 "$work/greetd" --config "$work/seat-test.conf" >"$work/worker-loss.log" 2>&1 & first=$!
@@ -97,8 +116,8 @@ os.kill(int(row[2]), signal.SIGKILL)
 time.sleep(1)
 assert latest() == row, 'worker death incorrectly authorized forced takeover'
 PY
-if wait "$first"; then echo 'unconfirmed worker death must fail controller' >&2; exit 1; fi
-unset first
+wait "$first"; unset first
+grep -q 'error:' "$work/worker-loss.log"
 if [[ -n ${CAGE_BINARY:-} && -n ${REGREET_BINARY:-} ]]; then
     cp "$CAGE_BINARY" "$work/cage"; cp "$REGREET_BINARY" "$work/regreet"
     cp "$GREETD_FIXTURE_BUILD/headless-session.so" "$work/headless-session.so"
@@ -123,6 +142,6 @@ PY
 fi
 GREETD_TEST_MODE=1 "$work/greetd" --config "$work/seat-test.conf" >"$work/loss.log" 2>&1 & first=$!
 sleep .5; kill -TERM "$daemon"; wait "$daemon"; unset daemon
-if wait "$first"; then echo 'owner loss must fail controller' >&2; exit 1; fi
-unset first
+wait "$first"; unset first
+grep -q 'error:' "$work/loss.log"
 echo 'Private PAM metadata, positive pre-close handoff, separate worker outcomes, per-seat isolation and no unconfirmed takeover passed'
