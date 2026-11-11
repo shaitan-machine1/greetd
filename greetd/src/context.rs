@@ -56,6 +56,7 @@ pub struct Context {
 }
 
 impl Context {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: crate::config::ConfigFile,
         term_mode: TerminalMode,
@@ -113,14 +114,14 @@ impl Context {
             match scheduled_session.get_state().await {
                 Ok(SessionState::Ready) => break,
                 Ok(SessionState::Question(_, _)) => scheduled_session.post_response(None).await?,
-                Err(err) => return Err(format!("session start failed: {}", err).into()),
+                Err(err) => return Err(format!("session start failed: {err}").into()),
             }
         }
 
         scheduled_session.send_args(cmd, vec![]).await?;
         tokio::time::timeout(Duration::from_secs(60), scheduled_session.start())
             .await
-            .map_err(|_| Error::Error("session startup deadline exceeded".into()))?
+            .map_err(|_| Error::Other("session startup deadline exceeded".into()))?
     }
 
     /// Directly start a greeter session, bypassing the normal scheduling. This
@@ -162,12 +163,17 @@ impl Context {
     /// Create runfile used to check if greetd was already started since boot
     pub fn create_runfile(&self) {
         if let Err(err) = File::create(&self.runfile) {
-            eprintln!("could not create runfile: {}", err);
+            eprintln!("could not create runfile: {err}");
         }
     }
 
     /// Directly start an initial session, bypassing the normal scheduling.
-    pub async fn start_user_session(&self, user: &str, cmd: Vec<String>) -> Result<(), Error> {
+    pub async fn start_user_session(
+        &self,
+        user: &str,
+        service: &str,
+        cmd: Vec<String>,
+    ) -> Result<(), Error> {
         {
             let inner = self.inner.read().await;
             if inner.current.is_some() {
@@ -178,7 +184,7 @@ impl Context {
         let mut inner = self.inner.write().await;
         inner.current = Some(SessionChildSet {
             child: self
-                .start_unauthenticated_session(SessionClass::User, user, &self.pam_service, cmd)
+                .start_unauthenticated_session(SessionClass::User, user, service, cmd)
                 .await?,
             time: Instant::now(),
             is_greeter: false,
@@ -342,7 +348,7 @@ impl Context {
             drop(inner);
             let child = tokio::time::timeout(Duration::from_secs(60), scheduled.session.start())
                 .await
-                .map_err(|_| Error::Error("session startup deadline exceeded".into()))??;
+                .map_err(|_| Error::Other("session startup deadline exceeded".into()))??;
             self.inner.write().await.current = Some(SessionChildSet {
                 child,
                 time: Instant::now(),
@@ -397,10 +403,10 @@ impl Context {
             drop(inner);
             let s = match tokio::time::timeout(Duration::from_secs(60), p.session.start())
                 .await
-                .map_err(|_| Error::Error("session startup deadline exceeded".into()))?
+                .map_err(|_| Error::Other("session startup deadline exceeded".into()))?
             {
                 Ok(s) => s,
-                Err(e) => return Err(format!("session start failed: {}", e).into()),
+                Err(e) => return Err(format!("session start failed: {e}").into()),
             };
             let mut inner = self.inner.write().await;
             inner.current = Some(SessionChildSet {
@@ -447,10 +453,10 @@ impl Context {
                                 scheduled.session.start(),
                             )
                             .await
-                            .map_err(|_| Error::Error("session startup deadline exceeded".into()))?
+                            .map_err(|_| Error::Other("session startup deadline exceeded".into()))?
                             {
                                 Ok(s) => s,
-                                Err(e) => return Err(format!("session start failed: {}", e).into()),
+                                Err(e) => return Err(format!("session start failed: {e}").into()),
                             };
                             let mut inner = self.inner.write().await;
                             inner.current = Some(SessionChildSet {

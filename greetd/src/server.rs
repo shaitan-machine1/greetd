@@ -45,13 +45,13 @@ fn wait_vt(term_mode: &TerminalMode) -> Result<(), Error> {
 fn wrap_result<T>(res: Result<T, Error>) -> Response {
     match res {
         Ok(_) => Response::Success,
-        Err(Error::AuthError(msg)) => Response::Error {
+        Err(Error::Auth(msg)) => Response::Error {
             error_type: ErrorType::AuthError,
             description: msg,
         },
         Err(e) => Response::Error {
             error_type: ErrorType::Error,
-            description: format!("{}", e),
+            description: e.to_string(),
         },
     }
 }
@@ -130,7 +130,7 @@ fn get_tty(config: &Config) -> Result<TerminalMode, Error> {
                 {
                     let vt = term_name[TTY_PREFIX.len()..]
                         .parse()
-                        .map_err(|e| Error::Error(format!("unable to parse tty number: {}", e)))?;
+                        .map_err(|e| Error::Other(format!("unable to parse tty number: {e}")))?;
 
                     TerminalMode::Terminal {
                         path: term_name,
@@ -144,12 +144,12 @@ fn get_tty(config: &Config) -> Result<TerminalMode, Error> {
                 // We don't have a usable terminal, so we have to jump through some hoops
                 _ => {
                     let sys_term = Terminal::open("/dev/tty0")
-                        .map_err(|e| format!("unable to open terminal: {}", e))?;
+                        .map_err(|e| format!("unable to open terminal: {e}"))?;
                     let vt = sys_term
                         .vt_get_current()
-                        .map_err(|e| format!("unable to get current VT: {}", e))?;
+                        .map_err(|e| format!("unable to get current VT: {e}"))?;
                     TerminalMode::Terminal {
-                        path: format!("/dev/tty{}", vt),
+                        path: format!("/dev/tty{vt}"),
                         vt,
                         switch: false,
                     }
@@ -157,25 +157,30 @@ fn get_tty(config: &Config) -> Result<TerminalMode, Error> {
             }
         }
         VtSelection::Next => {
-            let term = Terminal::open("/dev/tty0")
-                .map_err(|e| format!("unable to open terminal: {}", e))?;
+            let term =
+                Terminal::open("/dev/tty0").map_err(|e| format!("unable to open terminal: {e}"))?;
             let vt = term
                 .vt_get_next()
-                .map_err(|e| format!("unable to get next VT: {}", e))?;
+                .map_err(|e| format!("unable to get next VT: {e}"))?;
             TerminalMode::Terminal {
-                path: format!("/dev/tty{}", vt),
+                path: format!("/dev/tty{vt}"),
                 vt,
                 switch: config.file.terminal.switch,
             }
         }
         VtSelection::None => TerminalMode::Stdin,
         VtSelection::Specific(vt) => TerminalMode::Terminal {
-            path: format!("/dev/tty{}", vt),
+            path: format!("/dev/tty{vt}"),
             vt,
             switch: config.file.terminal.switch,
         },
     };
     Ok(term)
+}
+
+fn pam_service_exists(service: &str) -> bool {
+    Path::new(&format!("/etc/pam.d/{}", service)).exists()
+        || Path::new(&format!("/usr/lib/pam.d/{}", service)).exists()
 }
 
 // Listener is a convenience wrapper for creating the UnixListener we need, and
@@ -231,9 +236,9 @@ impl Listener {
         };
         let _ = std::fs::remove_file(&path);
         let listener =
-            UnixListener::bind(&path).map_err(|e| format!("unable to open listener: {}", e))?;
+            UnixListener::bind(&path).map_err(|e| format!("unable to open listener: {e}"))?;
         chown(path.as_str(), Some(uid), Some(gid))
-            .map_err(|e| format!("unable to chown greetd socket at {}: {}", path, e))?;
+            .map_err(|e| format!("unable to chown greetd socket at {path}: {e}"))?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         Ok((path, Listener(listener, lock)))
     }
@@ -276,8 +281,7 @@ pub async fn main(mut config: Config) -> Result<(), Error> {
         {
             return Path::new(directory).join(name).is_file();
         }
-        Path::new(&format!("/etc/pam.d/{}", name)).exists()
-            || Path::new(&format!("/usr/lib/pam.d/{}", name)).exists()
+        pam_service_exists(name)
     };
     let service = if available(&config.file.general.service) {
         config.file.general.service.clone()
@@ -314,11 +318,11 @@ pub async fn main(mut config: Config) -> Result<(), Error> {
     let term_mode = get_tty(&config)?;
 
     if !config.file.terminal.switch {
-        wait_vt(&term_mode).map_err(|e| format!("unable to wait VT: {}", e))?;
+        wait_vt(&term_mode).map_err(|e| format!("unable to wait VT: {e}"))?;
     }
 
     let initial_session = config.file.initial_session.take();
-    config.file.general.service = service;
+    config.file.general.service = service.clone();
     config.file.default_session.service = greeter_service;
     let ctx = Rc::new(Context::new(
         config.file,
@@ -328,15 +332,25 @@ pub async fn main(mut config: Config) -> Result<(), Error> {
     ));
 
     if let (Some(s), true) = (initial_session, ctx.is_first_run()) {
-        if let Err(e) = ctx.start_user_session(&s.user, vec![s.command]).await {
-            eprintln!("unable to start greeter: {}", e);
-            reset_vt(&term_mode).map_err(|e| format!("unable to reset VT: {}", e))?;
+        let initial_service = if available(&s.service) {
+            &s.service
+        } else if settings.is_some() {
+            return Err("managed initial PAM service is missing".into());
+        } else {
+            &service
+        };
+        if let Err(e) = ctx
+            .start_user_session(&s.user, initial_service, vec![s.command])
+            .await
+        {
+            eprintln!("unable to start greeter: {e}");
+            reset_vt(&term_mode).map_err(|e| format!("unable to reset VT: {e}"))?;
 
             return Err(e);
         }
     } else if let Err(e) = ctx.greet().await {
-        eprintln!("unable to start greeter: {}", e);
-        reset_vt(&term_mode).map_err(|e| format!("unable to reset VT: {}", e))?;
+        eprintln!("unable to start greeter: {e}");
+        reset_vt(&term_mode).map_err(|e| format!("unable to reset VT: {e}"))?;
 
         return Err(e);
     }
@@ -373,12 +387,12 @@ pub async fn main(mut config: Config) -> Result<(), Error> {
                     task::spawn_local(async move {
                         let _permit = permit;
                         if let Err(e) = client_handler(&client_ctx, stream).await {
-                            if let Err(error) = client_ctx.cancel().await { eprintln!("session cancellation failed: {}", error); }
-                            eprintln!("client loop failed: {}", e);
+                            if let Err(error) = client_ctx.cancel().await { eprintln!("session cancellation failed: {error}"); }
+                            eprintln!("client loop failed: {e}");
                         }
                     });
                 },
-                Err(err) => return Err(format!("accept: {}", err).into()),
+                Err(err) => return Err(format!("accept: {err}").into()),
             }
         }
     }

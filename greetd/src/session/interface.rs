@@ -26,17 +26,17 @@ trait AsyncSend {
 }
 
 #[async_trait]
-impl<'a> AsyncSend for ParentToSessionChild<'a> {
+impl AsyncSend for ParentToSessionChild<'_> {
     async fn send(&self, sock: &mut TokioUnixDatagram) -> Result<(), Error> {
         let mut out =
-            serde_json::to_vec(self).map_err(|e| format!("unable to serialize message: {}", e))?;
+            serde_json::to_vec(self).map_err(|e| format!("unable to serialize message: {e}"))?;
         if out.len() > 10240 {
             out.scramble();
             return Err("session worker request exceeded its bounded frame".into());
         }
         sock.send(&out)
             .await
-            .map_err(|e| format!("unable to send message: {}", e))?;
+            .map_err(|e| format!("unable to send message: {e}"))?;
         out.scramble();
         Ok(())
     }
@@ -49,14 +49,14 @@ impl AsyncRecv<SessionChildToParent> for SessionChildToParent {
         let len = sock
             .recv(&mut data[..])
             .await
-            .map_err(|e| format!("unable to recieve message: {}", e))?;
+            .map_err(|e| format!("unable to recieve message: {e}"))?;
         let msg = serde_json::from_slice(&data[..len])
-            .map_err(|e| format!("unable to deserialize message: {}", e))?;
+            .map_err(|e| format!("unable to deserialize message: {e}"))?;
         Ok(msg)
     }
 }
 
-/// SessionChild tracks the processes spawned by a session
+/// Tracks the processes spawned by a session
 pub struct SessionChild {
     pub task: Pid,
     pub sub_task: Pid,
@@ -137,13 +137,20 @@ impl Session {
     pub fn new_external(backend: Option<crate::managed::Backend>) -> Result<Session, Error> {
         // Pipe used to communicate the true PID of the final child.
         let (parentfd, childfd) =
-            UnixDatagram::pair().map_err(|e| format!("could not create pipe: {}", e))?;
+            UnixDatagram::pair().map_err(|e| format!("could not create pipe: {e}"))?;
 
         parentfd.set_nonblocking(true)?;
         let watched_channel = parentfd.try_clone()?;
         let parentfd = TokioUnixDatagram::from_std(parentfd)?;
         let raw_child = childfd.as_raw_fd();
-        let mut process = std::process::Command::new(std::env::current_exe()?);
+        // Preserve the exact running image across replacement/unlink, without
+        // running allocating Rust code in an explicit fork child.
+        let executable = if cfg!(target_os = "linux") {
+            std::path::PathBuf::from("/proc/self/exe")
+        } else {
+            std::env::current_exe()?
+        };
+        let mut process = std::process::Command::new(executable);
         process.args([
             "--session-worker",
             &raw_child.to_string(),

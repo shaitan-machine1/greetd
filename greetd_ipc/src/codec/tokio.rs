@@ -1,4 +1,23 @@
-//! Bounded asynchronous greetd wire codec (native-endian u32 length + JSON).
+//! Bounded native-endian length + JSON frames.
+//! Asynchronous reader/writer implementation, operating on an implementer of
+//! [`tokio::io::AsyncReadExt`] and [`tokio::io::AsyncWriteExt`].
+//!
+//! # Example
+//!
+//! ```no_run
+//! use std::env;
+//! use tokio::net::UnixStream;
+//! use greetd_ipc::{Request, Response};
+//! use greetd_ipc::codec::TokioCodec;
+//!
+//! #[tokio::main(flavor = "current_thread")]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let mut stream = UnixStream::connect(env::var("GREETD_SOCK")?).await?;
+//!     Request::CreateSession { username: "john".to_string() }.write_to(&mut stream).await?;
+//!     let resp = Response::read_from(&mut stream).await?;
+//!     Ok(())
+//! }
+//! ```
 use crate::{
     codec::{check_size, Error},
     Request, Response,
@@ -7,6 +26,7 @@ use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Reader/writer implementation over [`tokio::io::AsyncReadExt`] and [`tokio::io::AsyncWriteExt`].
 #[async_trait]
 pub trait TokioCodec {
     async fn read_from<T: AsyncReadExt + Unpin + Send>(stream: &mut T) -> Result<Self, Error>

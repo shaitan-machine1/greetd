@@ -39,7 +39,7 @@ fn run() -> Result<(), Error> {
     libmultiseatd::launch::fill_standard_streams()?;
     let config = config::read_config()?;
     if cfg!(feature = "debug") {
-        eprintln!("config: {:?}", config);
+        eprintln!("config: {config:?}");
     }
     if !(cfg!(feature = "test-support") && std::env::var_os("GREETD_TEST_MODE").is_some()) {
         mlockall(MlockAllFlags::all())

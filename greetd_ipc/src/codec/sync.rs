@@ -1,4 +1,23 @@
-//! Bounded synchronous greetd wire codec (native-endian u32 length + JSON).
+//! Bounded native-endian length + JSON frames.
+//! Synchronous reader/writer implementation, operating on an implementer of [`std::io::Read`] and
+//! [`std::io::Write`].
+//!
+//! # Example
+//!
+//! ```no_run
+//! use std::env;
+//! use std::os::unix::net::UnixStream;
+//! use greetd_ipc::{Request, Response};
+//! use greetd_ipc::codec::SyncCodec;
+//!
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let mut stream = UnixStream::connect(env::var("GREETD_SOCK")?)?;
+//!     Request::CreateSession { username: "john".to_string() }.write_to(&mut stream)?;
+//!     let resp = Response::read_from(&mut stream)?;
+//!     Ok(())
+//! }
+//! ```
+
 use crate::{
     codec::{check_size, Error},
     Request, Response,
@@ -6,6 +25,7 @@ use crate::{
 use serde::{de::DeserializeOwned, Serialize};
 use std::io::{Read, Write};
 
+/// Reader/writer implementation over [`std::io::Read`] and [`std::io::Write`].
 pub trait SyncCodec {
     fn read_from<T: Read>(stream: &mut T) -> Result<Self, Error>
     where
