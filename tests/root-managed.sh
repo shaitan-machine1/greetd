@@ -14,7 +14,7 @@ if (( EUID != 0 )); then
     cc -Wall -Wextra -Werror -fPIC -shared "$repo/tests/fixtures/pam-managed.c" -lpam -o "$build/pam_fixture.so"
     cc -Wall -Wextra -Werror "$repo/tests/fixtures/seat-client.c" -I"$LIBSEAT_SOURCE/include" -L"$LIBSEAT_BUILD" -Wl,-rpath,"$LIBSEAT_BUILD" -lseat -o "$build/seat-client"
     if [[ -n ${CAGE_BINARY:-} && -n ${REGREET_BINARY:-} ]]; then
-        cc -Wall -Wextra -Werror -fPIC -shared "$repo/tests/fixtures/headless-session.c" $(pkg-config --cflags --libs wlroots-0.20 wayland-server) -o "$build/headless-session.so"
+        cc -Wall -Wextra -Werror -fPIC -shared "$repo/tests/fixtures/headless-session.c" $(pkg-config --cflags --libs wlroots-0.20 wayland-server) -I"$LIBSEAT_SOURCE/include" -L"$LIBSEAT_BUILD" -lseat -o "$build/headless-session.so"
         cc -Wall -Wextra -Werror "$repo/tests/fixtures/ui-exec.c" -o "$build/ui-exec"
     fi
     sudo -n env GREETD_NATIVE="${GREETD_NATIVE:-0}" CAGE_BINARY="${CAGE_BINARY:-}" REGREET_BINARY="${REGREET_BINARY:-}" LIBSEAT_BUILD="$LIBSEAT_BUILD" MULTISEATD_BINARY="$MULTISEATD_BINARY" SEAT_LAUNCH_BINARY="$SEAT_LAUNCH_BINARY" GREETD_FIXTURE_BUILD="$build" timeout --signal=TERM --kill-after=10s 150s bash "$0" --root
@@ -138,7 +138,7 @@ PY
     [[ -s $work/ui.log ]]; sleep 1; kill -0 "$graphical"
     pgrep -f "^$work/regreet --logs $work/regreet.log" >/dev/null
     kill -TERM "$graphical"; wait "$graphical"; unset graphical
-    echo 'Stock Cage/wlroots consumed maintained libseat FD before stock ReGreet exec; no authority/seatd/TTY leak'
+    echo 'Stock Cage/wlroots consumed strict/native bootstrap before stock ReGreet exec; no authority/seatd/TTY leak'
 fi
 GREETD_TEST_MODE=1 "$work/greetd" --config "$work/seat-test.conf" >"$work/loss.log" 2>&1 & first=$!
 sleep .5; kill -TERM "$daemon"; wait "$daemon"; unset daemon
