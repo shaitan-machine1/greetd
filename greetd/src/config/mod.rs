@@ -44,7 +44,6 @@ pub struct ConfigSession {
 #[derive(Debug, Eq, PartialEq, Default)]
 pub struct ConfigInternal {
     pub session_worker: usize,
-    pub worker_parent: u32,
 }
 
 #[derive(Debug, Eq, PartialEq, Default)]
@@ -55,7 +54,6 @@ pub struct ConfigTerminal {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ConfigGeneral {
-    pub multiseat: Option<crate::managed::Settings>,
     pub source_profile: bool,
     pub runfile: String,
     pub service: String,
@@ -64,7 +62,6 @@ pub struct ConfigGeneral {
 impl Default for ConfigGeneral {
     fn default() -> Self {
         ConfigGeneral {
-            multiseat: None,
             source_profile: true,
             runfile: RUNFILE.to_string(),
             service: GENERAL_SERVICE.to_string(),
@@ -101,7 +98,7 @@ fn maybe_unquote(s: &str) -> Result<String, Error> {
 
 fn parse_config(config_str: &str) -> Result<ConfigFile, Error> {
     let config = inish::parse(config_str)?;
-    let mut general = match config.get("general") {
+    let general = match config.get("general") {
         Some(section) => {
             let runfilestr = section.get("runfile").unwrap_or(&RUNFILE);
             let runfile = maybe_unquote(runfilestr)
@@ -112,7 +109,6 @@ fn parse_config(config_str: &str) -> Result<ConfigFile, Error> {
                 .map_err(|e| format!("unable to read general.service: {e}"))?;
 
             ConfigGeneral {
-                multiseat: None,
                 source_profile: section
                     .get("source_profile")
                     .unwrap_or(&"true")
@@ -179,63 +175,6 @@ fn parse_config(config_str: &str) -> Result<ConfigFile, Error> {
         None => None,
     };
 
-    if let Some(section) = config.get("multiseat") {
-        for key in section.keys() {
-            if !matches!(
-                *key,
-                "seat"
-                    | "vt"
-                    | "run_directory"
-                    | "test_pam_dir"
-                    | "test_preload"
-                    | "test_library_path"
-            ) {
-                return Err(format!("unknown multiseat setting: {}", key).into());
-            }
-        }
-        let seat = maybe_unquote(section.get("seat").ok_or("multiseat.seat is required")?)?;
-        let directory = match section.get("run_directory") {
-            Some(value) => maybe_unquote(value)?,
-            None => format!("/run/greetd-{}", seat),
-        };
-        let setting = crate::managed::Settings {
-            seat,
-            vt: section
-                .get("vt")
-                .map(|value| maybe_unquote(value))
-                .transpose()?
-                .unwrap_or_else(|| "0".into())
-                .parse::<u32>()
-                .map_err(|error| error.to_string())?,
-            directory,
-            system_bus: env::var("DBUS_SYSTEM_BUS_ADDRESS").ok(),
-            test_pam_dir: section
-                .get("test_pam_dir")
-                .map(|value| maybe_unquote(value))
-                .transpose()?,
-            test_preload: section
-                .get("test_preload")
-                .map(|value| maybe_unquote(value))
-                .transpose()?,
-            test_library_path: section
-                .get("test_library_path")
-                .map(|value| maybe_unquote(value))
-                .transpose()?,
-        };
-        setting.validate()?;
-        if config
-            .get("general")
-            .and_then(|section| section.get("source_profile"))
-            .is_some()
-            && general.source_profile
-        {
-            return Err("source_profile is forbidden in managed mode".into());
-        }
-        general.source_profile = false;
-        general.runfile = format!("{}/started-{}", setting.directory, setting.instance());
-        general.multiseat = Some(setting);
-    }
-
     let terminal = match config.get("terminal") {
         Some(section) => Ok(ConfigTerminal {
             vt: maybe_unquote(section.get("vt").ok_or("VT not specified")?)
@@ -248,16 +187,9 @@ fn parse_config(config_str: &str) -> Result<ConfigFile, Error> {
                 .parse()
                 .map_err(|e| format!("could not parse switch: {e}"))?,
         }),
-        None if general.multiseat.is_some() => Ok(ConfigTerminal {
-            vt: VtSelection::None,
-            switch: false,
-        }),
         None => Err("no terminal specified"),
     }?;
 
-    if general.multiseat.is_some() && (terminal.vt != VtSelection::None || terminal.switch) {
-        return Err("multiseatd owns the VT; terminal management must be disabled".into());
-    }
     Ok(ConfigFile {
         initial_session,
         default_session,
@@ -273,19 +205,7 @@ pub fn read_config() -> Result<Config, Error> {
     opts.optflag("h", "help", "print this help menu");
     opts.optopt("s", "socket-path", "socket path to use", "SOCKET_PATH");
     opts.optopt("c", "config", "config file to use", "CONFIG_FILE");
-    opts.optopt(
-        "",
-        "vt",
-        "immutable managed binding, or unmanaged terminal",
-        "VT",
-    );
-    opts.optopt("", "seat", "explicit managed seat", "SEAT");
-    opts.optopt(
-        "",
-        "worker-parent",
-        "session worker parent (internal)",
-        "PID",
-    );
+    opts.optopt("", "vt", "use the specified vt", "VT");
     opts.optopt(
         "w",
         "session-worker",
@@ -302,10 +222,6 @@ pub fn read_config() -> Result<Config, Error> {
     }
 
     let internal = ConfigInternal {
-        worker_parent: matches
-            .opt_get::<u32>("worker-parent")
-            .map_err(|error| error.to_string())?
-            .unwrap_or(0),
         session_worker: matches
             .opt_get("session-worker")
             .expect("unable to parse session-worker")
@@ -326,23 +242,9 @@ pub fn read_config() -> Result<Config, Error> {
     }?;
     let mut file = parse_config(&config_str)?;
 
-    if let Some(settings) = &mut file.general.multiseat {
-        if let Some(seat) = matches.opt_str("seat") {
-            settings.seat = seat;
-        }
-        if let Some(vt) = matches.opt_str("vt") {
-            settings.vt = vt.parse::<u32>().map_err(|error| error.to_string())?;
-        }
-        settings.validate()?;
-        file.general.runfile = format!("{}/started-{}", settings.directory, settings.instance());
-    } else {
-        if matches.opt_present("seat") {
-            return Err("--seat requires explicit managed configuration".into());
-        }
-        if let Some(vt) = matches.opt_str("vt") {
-            file.terminal.vt = vt.parse()?;
-        }
-    }
+    if let Some(vt) = matches.opt_str("vt") {
+        file.terminal.vt = vt.parse()?
+    };
 
     if file.default_session.command.is_empty() {
         return Err(Error::Config(
@@ -490,7 +392,6 @@ runfile = \"/path/to/greetd.state\"
                     service: "greetd-greeter".to_string(),
                 },
                 general: ConfigGeneral {
-                    multiseat: None,
                     source_profile: false,
                     runfile: "/path/to/greetd.state".to_string(),
                     service: "greetd".to_string(),
@@ -586,47 +487,6 @@ vt = current
                 initial_session: None,
             }
         );
-    }
-
-    #[test]
-    fn managed_config_disables_terminal_and_profiles_without_command_policy() {
-        let base =
-            "[default_session]\ncommand = \"cage -- regreet\"\n[multiseat]\nseat = \"seat-test\"\n";
-        let config = parse_config(base).unwrap();
-        assert_eq!(config.terminal.vt, VtSelection::None);
-        assert!(!config.terminal.switch);
-        assert!(!config.general.source_profile);
-        let settings = config.general.multiseat.unwrap();
-        assert_eq!(settings.directory, "/run/greetd-seat-test");
-        assert_eq!(settings.vt, 0);
-        let mut a = settings.clone();
-        a.vt = 7;
-        let mut b = settings.clone();
-        b.vt = 8;
-        assert_ne!(a.instance(), b.instance());
-        assert_ne!(a.socket_path(), b.socket_path());
-        assert!(parse_config(&format!("{base}vt = 64\n")).is_err());
-        for command in [
-            vec!["weston".into()],
-            vec!["/bin/sh".into(), "-c".into(), "true".into()],
-            vec!["./user-owned-entrypoint".into()],
-        ] {
-            assert!(settings.arguments(&command).is_ok());
-        }
-        assert_eq!(
-            settings
-                .arguments(&["weston --backend=drm-backend.so".into()])
-                .unwrap(),
-            ["weston", "--backend=drm-backend.so"]
-        );
-        assert!(settings.arguments(&[]).is_err());
-        assert!(settings.arguments(&[String::new()]).is_err());
-        assert!(parse_config(&format!("{base}launcher = \"old-wrapper\"\n")).is_err());
-        assert!(parse_config(&format!("{base}trusted_entrypoints = \"weston\"\n")).is_err());
-        assert!(parse_config(&format!("{base}unknown = true\n")).is_err());
-        assert!(parse_config(&format!("{base}[terminal]\nvt = 1\n")).is_err());
-        assert!(parse_config(&format!("{base}[general]\nsource_profile = true\n")).is_err());
-        assert!(parse_config(&base.replace("seat-test", "../../bad")).is_err());
     }
 
     #[test]

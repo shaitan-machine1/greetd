@@ -33,7 +33,6 @@ pub enum TerminalMode {
         switch: bool,
     },
     Stdin,
-    Managed(Box<crate::managed::Settings>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -43,7 +42,7 @@ pub enum SessionClass {
 }
 
 impl SessionClass {
-    pub(super) fn as_str(&self) -> &str {
+    fn as_str(&self) -> &str {
         match self {
             SessionClass::Greeter => "greeter",
             SessionClass::User => "user",
@@ -58,7 +57,6 @@ pub enum ParentToSessionChild<'a> {
         class: SessionClass,
         user: &'a str,
         authenticate: bool,
-        foreground: bool,
         tty: TerminalMode,
         source_profile: bool,
         listener_path: &'a str,
@@ -79,25 +77,7 @@ impl<'a> ParentToSessionChild<'a> {
         sock: &UnixDatagram,
         data: &'a mut [u8; 10240],
     ) -> Result<ParentToSessionChild<'a>, Error> {
-        let len = loop {
-            if super::managed_worker::terminated() {
-                return Err("session worker terminated".into());
-            }
-            match sock.recv(&mut data[..]) {
-                Ok(len) => break len,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::Interrupted
-                            | std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    continue
-                }
-                Err(error) => return Err(error.into()),
-            }
-        };
+        let len = sock.recv(&mut data[..])?;
         let msg = serde_json::from_slice(&data[..len])?;
         Ok(msg)
     }
@@ -109,9 +89,6 @@ pub enum SessionChildToParent {
     Error(Error),
     PamMessage { style: AuthMessageType, msg: String },
     FinalChildPid(u64),
-    DeviceTeardown { result: Result<(), String> },
-    Finished { result: Result<(), String> },
-    ManagedSession { session: Option<String> },
 }
 
 impl SessionChildToParent {
@@ -127,14 +104,13 @@ impl SessionChildToParent {
 /// started by [`crate::session::interface::Session::start`].
 fn worker(sock: &UnixDatagram) -> Result<(), Error> {
     let mut data = [0; 10240];
-    let (service, class, user, authenticate, foreground, tty, source_profile, listener_path) =
+    let (service, class, user, authenticate, tty, source_profile, listener_path) =
         match ParentToSessionChild::recv(sock, &mut data)? {
             ParentToSessionChild::InitiateLogin {
                 service,
                 class,
                 user,
                 authenticate,
-                foreground,
                 tty,
                 source_profile,
                 listener_path,
@@ -143,7 +119,6 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
                 class,
                 user,
                 authenticate,
-                foreground,
                 tty,
                 source_profile,
                 listener_path,
@@ -152,30 +127,9 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
             msg => return Err(format!("expected InitiateLogin or Cancel, got: {msg:?}").into()),
         };
 
-    let managed = match &tty {
-        TerminalMode::Managed(settings) => Some(settings),
-        _ => None,
-    };
-    let host = if let Some(settings) = managed {
-        super::managed_worker::prepare(settings, sock)?;
-        Some(super::managed_worker::Host::new(settings, sock)?)
-    } else {
-        None
-    };
     let conv = Box::pin(SessionConv::new(sock));
-    let mut pam = PamSession::start(
-        service,
-        user,
-        conv,
-        managed.and_then(|settings| settings.test_pam_dir.as_deref()),
-    )?;
+    let mut pam = PamSession::start(service, user, conv)?;
 
-    // Move the owner AFTER PAM construction: on every return/panic it drops
-    // first, reporting actual device teardown BEFORE PAM's close destructor.
-    let mut host = host;
-    if let Some(host) = &host {
-        host.configure_pam(&mut pam)?;
-    }
     if authenticate {
         pam.authenticate(PamFlag::NONE)?;
     }
@@ -188,9 +142,7 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
     };
 
     // Not the credentials you think.
-    if managed.is_none() {
-        pam.setcred(PamFlag::ESTABLISH_CRED)?;
-    }
+    pam.setcred(PamFlag::ESTABLISH_CRED)?;
 
     // Mark authentication as a success.
     SessionChildToParent::Success.send(sock)?;
@@ -198,7 +150,7 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
     // Add GREETD_SOCK if this is a greeter session - we do this early as we are about to reuse the
     // buffer, invalidating our borrow.
     if let SessionClass::Greeter = class {
-        pam.putenv(&format!("GREETD_SOCK={}", listener_path))?;
+        pam.putenv(&format!("GREETD_SOCK={}", &listener_path))?;
     }
 
     // Fetch our arguments from the parent.
@@ -217,18 +169,6 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
         msg => return Err(format!("expected Start or Cancel, got: {msg:?}").into()),
     };
 
-    if let TerminalMode::Managed(settings) = &tty {
-        return super::managed_worker::run(
-            settings,
-            &class,
-            foreground,
-            env,
-            cmd,
-            &mut pam,
-            host.as_mut().expect("managed PAM host"),
-        );
-    }
-
     let pam_username = pam.get_user()?;
 
     let user = nix::unistd::User::from_name(&pam_username)?.ok_or("unable to get user info")?;
@@ -238,9 +178,6 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
 
     match tty {
         TerminalMode::Stdin => (),
-        TerminalMode::Managed(_) => {
-            unreachable!("managed worker handled before legacy terminal setup")
-        }
         TerminalMode::Terminal { path, vt, switch } => {
             // Tell PAM what TTY we're targeting, which is used by logind.
             pam.set_item(PamItemType::TTY, &format!("tty{vt}"))?;
@@ -339,7 +276,8 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
 
             // Run
             let cpath = CString::new("/bin/sh").unwrap();
-            match execve(
+
+            execve(
                 &cpath,
                 &[
                     &cpath,
@@ -347,10 +285,10 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
                     &CString::new(command).unwrap(),
                 ],
                 &envvec,
-            ) {
-                Ok(never) => match never {},
-                Err(_) => unsafe { libc::_exit(127) },
-            }
+            )
+            .expect("unable to exec");
+
+            unreachable!("after exec");
         }
     };
 
@@ -387,14 +325,10 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
 }
 
 pub fn main(sock: &UnixDatagram) -> Result<(), Error> {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker(sock)))
-        .unwrap_or_else(|_| Err("PAM host panicked".into()));
-    if let Err(error) = &result {
-        let _ = SessionChildToParent::Error(error.clone()).send(sock);
+    if let Err(e) = worker(sock) {
+        SessionChildToParent::Error(e.clone()).send(sock)?;
+        Err(e)
+    } else {
+        Ok(())
     }
-    let _ = SessionChildToParent::Finished {
-        result: result.as_ref().map(|_| ()).map_err(ToString::to_string),
-    }
-    .send(sock);
-    result
 }

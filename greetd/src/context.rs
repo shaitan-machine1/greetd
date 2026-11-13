@@ -15,10 +15,7 @@ use crate::{
     scrambler::Scrambler,
     session::{
         interface::{Session, SessionChild, SessionState},
-        worker::{
-            AuthMessageType as SessAuthMessageType, ParentToSessionChild, SessionClass,
-            TerminalMode,
-        },
+        worker::{AuthMessageType as SessAuthMessageType, SessionClass, TerminalMode},
     },
 };
 use greetd_ipc::AuthMessageType;
@@ -51,17 +48,19 @@ pub struct Context {
     source_profile: bool,
     runfile: String,
     listener_path: String,
-    backend: Option<crate::managed::Backend>,
-    initial_greeter_started: std::cell::Cell<bool>,
 }
 
 impl Context {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        config: crate::config::ConfigFile,
+        greeter_bin: String,
+        greeter_user: String,
+        greeter_service: String,
+        pam_service: String,
         term_mode: TerminalMode,
+        source_profile: bool,
+        runfile: String,
         listener_path: String,
-        backend: Option<crate::managed::Backend>,
     ) -> Context {
         Context {
             inner: RwLock::new(ContextInner {
@@ -69,16 +68,14 @@ impl Context {
                 scheduled: None,
                 configuring: None,
             }),
-            greeter_bin: config.default_session.command,
-            greeter_user: config.default_session.user,
-            greeter_service: config.default_session.service,
-            pam_service: config.general.service,
+            greeter_bin,
+            greeter_user,
+            greeter_service,
+            pam_service,
             term_mode,
-            source_profile: config.general.source_profile,
-            runfile: config.general.runfile,
+            source_profile,
+            runfile,
             listener_path,
-            backend,
-            initial_greeter_started: std::cell::Cell::new(false),
         }
     }
 
@@ -92,23 +89,17 @@ impl Context {
         service: &str,
         cmd: Vec<String>,
     ) -> Result<SessionChild, Error> {
-        if let TerminalMode::Managed(settings) = &self.term_mode {
-            settings.arguments(&cmd)?;
-        }
-        let foreground =
-            matches!(class, SessionClass::Greeter) && !self.initial_greeter_started.replace(true);
-        let mut scheduled_session = Session::new_external(self.backend.clone())?;
+        let mut scheduled_session = Session::new_external()?;
         scheduled_session
-            .initiate(ParentToSessionChild::InitiateLogin {
+            .initiate(
                 service,
                 class,
                 user,
-                authenticate: false,
-                foreground,
-                tty: self.term_mode.clone(),
-                source_profile: self.source_profile,
-                listener_path: &self.listener_path,
-            })
+                false,
+                &self.term_mode,
+                self.source_profile,
+                &self.listener_path,
+            )
             .await?;
         loop {
             match scheduled_session.get_state().await {
@@ -119,9 +110,7 @@ impl Context {
         }
 
         scheduled_session.send_args(cmd, vec![]).await?;
-        tokio::time::timeout(Duration::from_secs(60), scheduled_session.start())
-            .await
-            .map_err(|_| Error::Other("session startup deadline exceeded".into()))?
+        scheduled_session.start().await
     }
 
     /// Directly start a greeter session, bypassing the normal scheduling. This
@@ -199,14 +188,6 @@ impl Context {
             if inner.current.is_none() {
                 return Err("session not active".into());
             }
-            if self.backend.is_some()
-                && inner
-                    .current
-                    .as_ref()
-                    .is_some_and(|session| !session.is_greeter)
-            {
-                return Err("only the current greeter may configure a login".into());
-            }
             if inner.configuring.is_some() {
                 return Err("a session is already being configured".into());
             }
@@ -216,21 +197,20 @@ impl Context {
         }
 
         let mut session_set = SessionSet {
-            session: Session::new_external(self.backend.clone())?,
+            session: Session::new_external()?,
             time: Instant::now(),
         };
         session_set
             .session
-            .initiate(ParentToSessionChild::InitiateLogin {
-                service: &self.pam_service,
-                class: SessionClass::User,
-                user: &username,
-                authenticate: true,
-                foreground: false,
-                tty: self.term_mode.clone(),
-                source_profile: self.source_profile,
-                listener_path: &self.listener_path,
-            })
+            .initiate(
+                &self.pam_service,
+                SessionClass::User,
+                &username,
+                true,
+                &self.term_mode,
+                self.source_profile,
+                &self.listener_path,
+            )
             .await?;
 
         let mut session = Some(session_set);
@@ -294,9 +274,6 @@ impl Context {
 
     /// Schedule the session under configuration with the provided arguments.
     pub async fn start(&self, cmd: Vec<String>, env: Vec<String>) -> Result<(), Error> {
-        if let TerminalMode::Managed(settings) = &self.term_mode {
-            settings.arguments(&cmd)?;
-        }
         let mut session = self.inner.write().await.configuring.take();
 
         match &mut session {
@@ -327,66 +304,8 @@ impl Context {
         }
     }
 
-    /// Only an explicit positive device result authorizes normal handoff.
-    /// PAM close/final worker exit are independent, possibly much later events.
-    pub async fn check_workers(&self) -> Result<(), Error> {
-        if self.backend.is_none() {
-            return Ok(());
-        }
-        let mut inner = self.inner.write().await;
-        let ready = match &inner.current {
-            Some(current) => current.child.device_result()?.is_some(),
-            None => false,
-        };
-        if !ready {
-            return Ok(());
-        }
-        let previous = inner.current.take().expect("completed current worker");
-        let elapsed = previous.time.elapsed();
-        let was_greeter = previous.is_greeter;
-        drop(previous);
-        if let Some(mut scheduled) = inner.scheduled.take() {
-            drop(inner);
-            let child = tokio::time::timeout(Duration::from_secs(60), scheduled.session.start())
-                .await
-                .map_err(|_| Error::Other("session startup deadline exceeded".into()))??;
-            self.inner.write().await.current = Some(SessionChildSet {
-                child,
-                time: Instant::now(),
-                is_greeter: false,
-            });
-        } else {
-            if was_greeter {
-                return Err("greeter exited without creating a session".into());
-            }
-            if let Some(mut configuring) = inner.configuring.take() {
-                configuring.session.cancel().await?;
-            }
-            if elapsed < Duration::from_secs(1) {
-                sleep(Duration::from_secs(1)).await;
-            }
-            inner.current = Some(SessionChildSet {
-                child: self.start_greeter().await?,
-                time: Instant::now(),
-                is_greeter: true,
-            });
-        }
-        Ok(())
-    }
-
     /// Notify the Context of an alarm.
     pub async fn alarm(&self) -> Result<(), Error> {
-        if self.backend.is_some() {
-            self.check_workers().await?;
-            let inner = self.inner.read().await;
-            if inner.scheduled.is_some() {
-                if let Some(current) = &inner.current {
-                    current.child.term();
-                }
-                alarm::set(1);
-            }
-            return Ok(());
-        }
         // Keep trying to terminate the greeter until it gives up.
         let mut inner = self.inner.write().await;
 
@@ -405,10 +324,7 @@ impl Context {
                 return Ok(());
             }
             drop(inner);
-            let s = match tokio::time::timeout(Duration::from_secs(60), p.session.start())
-                .await
-                .map_err(|_| Error::Other("session startup deadline exceeded".into()))?
-            {
+            let s = match p.session.start().await {
                 Ok(s) => s,
                 Err(e) => return Err(format!("session start failed: {e}").into()),
             };
@@ -433,10 +349,6 @@ impl Context {
 
                 // We got an exit, see if it's something we need to clean up.
                 Ok(WaitStatus::Exited(pid, ..)) | Ok(WaitStatus::Signaled(pid, ..)) => {
-                    if self.backend.is_some() {
-                        self.check_workers().await?;
-                        continue;
-                    }
                     let mut inner = self.inner.write().await;
                     let (was_greeter, sesion_length) = match &inner.current {
                         Some(s) if s.child.owns_pid(pid) => {
@@ -452,13 +364,7 @@ impl Context {
                             // Our greeter finally bit the dust so we can
                             // start our scheduled session.
                             drop(inner);
-                            let s = match tokio::time::timeout(
-                                Duration::from_secs(60),
-                                scheduled.session.start(),
-                            )
-                            .await
-                            .map_err(|_| Error::Other("session startup deadline exceeded".into()))?
-                            {
+                            let s = match scheduled.session.start().await {
                                 Ok(s) => s,
                                 Err(e) => return Err(format!("session start failed: {e}").into()),
                             };
@@ -470,7 +376,7 @@ impl Context {
                             });
                         }
                         None => {
-                            if was_greeter && self.backend.is_none() {
+                            if was_greeter {
                                 return Err("greeter exited without creating a session".into());
                             }
                             if sesion_length < Duration::from_secs(1) {
@@ -512,21 +418,6 @@ impl Context {
         }
         if let Some(sess) = inner.current.take() {
             sess.child.term();
-            if self.backend.is_some() {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                loop {
-                    match waitpid(sess.child.task, Some(WaitPidFlag::WNOHANG)) {
-                        Ok(WaitStatus::StillAlive) if Instant::now() < deadline => {
-                            sleep(Duration::from_millis(25)).await
-                        }
-                        Ok(WaitStatus::StillAlive) => {
-                            sess.child.kill();
-                            break;
-                        }
-                        _ => break,
-                    }
-                }
-            }
         }
         Ok(())
     }

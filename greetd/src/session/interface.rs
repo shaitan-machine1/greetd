@@ -1,18 +1,21 @@
 use std::{
-    convert::TryFrom,
-    os::fd::OwnedFd,
-    os::unix::process::CommandExt,
+    ffi::CString,
     os::unix::{io::AsRawFd, net::UnixDatagram},
-    sync::Arc,
 };
 
-use nix::{sys::signal::Signal, unistd::Pid};
+use nix::{
+    fcntl::{fcntl, FcntlArg, FdFlag},
+    sys::signal::Signal,
+    unistd::{execv, fork, ForkResult, Pid},
+};
 
 use async_trait::async_trait;
 
 use tokio::net::UnixDatagram as TokioUnixDatagram;
 
-use super::worker::{AuthMessageType, ParentToSessionChild, SessionChildToParent};
+use super::worker::{
+    AuthMessageType, ParentToSessionChild, SessionChildToParent, SessionClass, TerminalMode,
+};
 use crate::{error::Error, scrambler::Scrambler};
 
 #[async_trait]
@@ -30,10 +33,6 @@ impl AsyncSend for ParentToSessionChild<'_> {
     async fn send(&self, sock: &mut TokioUnixDatagram) -> Result<(), Error> {
         let mut out =
             serde_json::to_vec(self).map_err(|e| format!("unable to serialize message: {e}"))?;
-        if out.len() > 10240 {
-            out.scramble();
-            return Err("session worker request exceeded its bounded frame".into());
-        }
         sock.send(&out)
             .await
             .map_err(|e| format!("unable to send message: {e}"))?;
@@ -60,7 +59,6 @@ impl AsyncRecv<SessionChildToParent> for SessionChildToParent {
 pub struct SessionChild {
     pub task: Pid,
     pub sub_task: Pid,
-    managed: Option<(crate::managed::Backend, Arc<OwnedFd>)>,
 }
 
 impl SessionChild {
@@ -69,51 +67,15 @@ impl SessionChild {
         self.task == pid
     }
 
-    pub fn device_result(&self) -> Result<Option<()>, Error> {
-        match &self.managed {
-            Some((backend, worker)) => backend.result(worker),
-            None => Ok(None),
-        }
-    }
-
     /// Send SIGTERM to the session child.
     pub fn term(&self) {
-        if let Some((_, worker)) = &self.managed {
-            crate::managed::signal(worker, libc::SIGTERM);
-        } else {
-            let _ = nix::sys::signal::kill(self.sub_task, Signal::SIGTERM);
-        }
+        let _ = nix::sys::signal::kill(self.sub_task, Signal::SIGTERM);
     }
 
     /// Send SIGKILL to the session child.
     pub fn kill(&self) {
-        if let Some((_, worker)) = &self.managed {
-            crate::managed::signal(worker, libc::SIGTERM);
-        } else {
-            let _ = nix::sys::signal::kill(self.sub_task, Signal::SIGKILL);
-            let _ = nix::sys::signal::kill(self.task, Signal::SIGKILL);
-        }
-    }
-}
-
-impl Drop for SessionChild {
-    fn drop(&mut self) {
-        if let Some((backend, worker)) = &self.managed {
-            backend.release(worker);
-        }
-    }
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        if !self.started {
-            if let Some((backend, worker)) = &self.managed {
-                backend.release(worker);
-                crate::managed::signal(worker, libc::SIGTERM);
-            } else {
-                let _ = nix::sys::signal::kill(self.task, Signal::SIGTERM);
-            }
-        }
+        let _ = nix::sys::signal::kill(self.sub_task, Signal::SIGKILL);
+        let _ = nix::sys::signal::kill(self.task, Signal::SIGKILL);
     }
 }
 
@@ -125,8 +87,6 @@ pub enum SessionState {
 
 /// A device to initiate a logged in PAM session.
 pub struct Session {
-    managed: Option<(crate::managed::Backend, Arc<OwnedFd>)>,
-    started: bool,
     task: Pid,
     sock: TokioUnixDatagram,
     last_msg: Option<SessionChildToParent>,
@@ -134,110 +94,66 @@ pub struct Session {
 
 impl Session {
     /// Create a session started as an external process.
-    pub fn new_external(backend: Option<crate::managed::Backend>) -> Result<Session, Error> {
+    pub fn new_external() -> Result<Session, Error> {
         // Pipe used to communicate the true PID of the final child.
         let (parentfd, childfd) =
             UnixDatagram::pair().map_err(|e| format!("could not create pipe: {e}"))?;
 
-        parentfd.set_nonblocking(true)?;
-        let watched_channel = parentfd.try_clone()?;
-        let parentfd = TokioUnixDatagram::from_std(parentfd)?;
         let raw_child = childfd.as_raw_fd();
-        // Preserve the exact running image across replacement/unlink, without
-        // running allocating Rust code in an explicit fork child.
-        let executable = if cfg!(target_os = "linux") {
-            std::path::PathBuf::from("/proc/self/exe")
-        } else {
-            std::env::current_exe()?
-        };
-        let mut process = std::process::Command::new(executable);
-        process.args([
-            "--session-worker",
-            &raw_child.to_string(),
-            "--worker-parent",
-            &std::process::id().to_string(),
-        ]);
-        unsafe {
-            process.pre_exec(move || {
-                let flags = libc::fcntl(raw_child, libc::F_GETFD);
-                if flags < 0 || libc::fcntl(raw_child, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let child = process.spawn()?;
-        let child = Pid::from_raw(child.id() as i32);
-        let managed = if let Some(backend) = backend {
-            let descriptor = crate::managed::pidfd(child.as_raw() as u32).inspect_err(|_| {
-                let _ = nix::sys::signal::kill(child, Signal::SIGTERM);
-            })?;
-            if let Err(error) = backend.track(descriptor.clone(), watched_channel) {
-                crate::managed::signal(&descriptor, libc::SIGTERM);
-                return Err(error);
+        let mut cur_flags = FdFlag::from_bits_retain(fcntl(raw_child, FcntlArg::F_GETFD)?);
+        cur_flags.remove(FdFlag::FD_CLOEXEC);
+        fcntl(raw_child, FcntlArg::F_SETFD(cur_flags))?;
+
+        // On Linux, /proc/self/exe is a reference to the original file, which remains valid
+        // in spite of unlink or rename similar to an already open fd. It is, however, not very
+        // portable. On FreeBSD, we would likely need to open our own process file early and rely
+        // on fexecve, using the KERN_PROC_PATHNAME sysctl to get the path.
+        #[allow(unreachable_code)]
+        let child = match unsafe { fork() }.map_err(|e| format!("unable to fork: {e}"))? {
+            ForkResult::Parent { child, .. } => child,
+            ForkResult::Child => {
+                execv(
+                    &CString::new("/proc/self/exe").unwrap(),
+                    &[
+                        &CString::new("greetd").unwrap(),
+                        &CString::new("--session-worker").unwrap(),
+                        &CString::new(format!("{}", raw_child as usize)).unwrap(),
+                    ],
+                )
+                .expect("unable to exec");
+
+                unreachable!("after exec");
             }
-            Some((backend, descriptor))
-        } else {
-            None
         };
+
         Ok(Session {
-            managed,
-            started: false,
             task: child,
-            sock: parentfd,
+            sock: TokioUnixDatagram::from_std(parentfd)?,
             last_msg: None,
         })
     }
 
-    async fn receive_one(&mut self) -> Result<SessionChildToParent, Error> {
-        if let Some((_, worker)) = &self.managed {
-            let descriptor = worker.try_clone()?;
-            let watched = unsafe { tokio::io::unix::AsyncFd::register(descriptor) }
-                .map_err(std::io::Error::from)?;
-            tokio::select! {
-                biased;
-                message = SessionChildToParent::recv(&mut self.sock) => message,
-                ready = watched.readable() => {
-                    let _ready = ready?;
-                    let mut data = [0; 10240];
-                    match self.sock.try_recv(&mut data) {
-                        Ok(length) => Ok(serde_json::from_slice(&data[..length])?),
-                        Err(_) => Err("managed PAM worker exited".into()),
-                    }
-                }
-            }
-        } else {
-            SessionChildToParent::recv(&mut self.sock).await
-        }
-    }
-
-    async fn receive(&mut self) -> Result<SessionChildToParent, Error> {
-        loop {
-            let message = self.receive_one().await?;
-            match message {
-                SessionChildToParent::ManagedSession { session } => {
-                    let (backend, worker) = self
-                        .managed
-                        .as_ref()
-                        .ok_or("unexpected containment metadata")?;
-                    backend.metadata(worker, session)?;
-                }
-                SessionChildToParent::DeviceTeardown { result } => {
-                    let (backend, worker) =
-                        self.managed.as_ref().ok_or("unexpected device result")?;
-                    backend.teardown(worker, result)?;
-                }
-                SessionChildToParent::Finished { .. } => {
-                    return Err("worker finished without the expected protocol response".into())
-                }
-                message => return Ok(message),
-            }
-        }
-    }
-
     /// Initiates the session, which will cause authentication to begin.
-    pub async fn initiate(&mut self, msg: ParentToSessionChild<'_>) -> Result<(), Error> {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn initiate(
+        &mut self,
+        service: &str,
+        class: SessionClass,
+        user: &str,
+        authenticate: bool,
+        term_mode: &TerminalMode,
+        source_profile: bool,
+        listener_path: &str,
+    ) -> Result<(), Error> {
+        let msg = ParentToSessionChild::InitiateLogin {
+            service,
+            class,
+            user,
+            authenticate,
+            tty: term_mode.clone(),
+            source_profile,
+            listener_path,
+        };
         msg.send(&mut self.sock).await?;
         Ok(())
     }
@@ -246,7 +162,7 @@ impl Session {
     pub async fn get_state(&mut self) -> Result<SessionState, Error> {
         let msg = match self.last_msg.take() {
             Some(msg) => msg,
-            None => self.receive().await?,
+            None => SessionChildToParent::recv(&mut self.sock).await?,
         };
 
         self.last_msg = Some(msg.clone());
@@ -267,10 +183,6 @@ impl Session {
     /// Cancel the session.
     pub async fn cancel(&mut self) -> Result<(), Error> {
         self.last_msg = None;
-        if let Some((_, worker)) = &self.managed {
-            crate::managed::signal(worker, libc::SIGTERM);
-            return Ok(());
-        }
         ParentToSessionChild::Cancel.send(&mut self.sock).await?;
         Ok(())
     }
@@ -297,7 +209,7 @@ impl Session {
         let msg = ParentToSessionChild::Args { env, cmd };
         msg.send(&mut self.sock).await?;
 
-        let msg = self.receive().await?;
+        let msg = SessionChildToParent::recv(&mut self.sock).await?;
 
         self.last_msg = Some(msg.clone());
 
@@ -315,22 +227,14 @@ impl Session {
     /// Start the session.
     ///
     pub async fn start(&mut self) -> Result<SessionChild, Error> {
-        if let Some((backend, worker)) = &self.managed {
-            backend.require_teardown(worker)?;
-        }
         let msg = ParentToSessionChild::Start;
         msg.send(&mut self.sock).await?;
 
         let sub_task = loop {
-            match self.receive().await? {
+            match SessionChildToParent::recv(&mut self.sock).await? {
                 SessionChildToParent::Error(e) => return Err(e),
                 SessionChildToParent::FinalChildPid(raw_pid) => {
-                    break Pid::from_raw(
-                        i32::try_from(raw_pid)
-                            .ok()
-                            .filter(|pid| *pid > 0)
-                            .ok_or("invalid child PID")?,
-                    );
+                    break Pid::from_raw(raw_pid as i32)
                 }
                 SessionChildToParent::PamMessage { .. } => {
                     // pam_conv after start, ignore
@@ -346,17 +250,11 @@ impl Session {
             };
         };
 
-        if let Some((backend, worker)) = &self.managed {
-            backend.watch(worker);
-        } else {
-            self.sock.shutdown(std::net::Shutdown::Both)?;
-        }
+        self.sock.shutdown(std::net::Shutdown::Both)?;
 
-        self.started = true;
         Ok(SessionChild {
             task: self.task,
             sub_task,
-            managed: self.managed.take(),
         })
     }
 }

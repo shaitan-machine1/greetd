@@ -26,7 +26,7 @@ fn reset_vt(term_mode: &TerminalMode) -> Result<(), Error> {
             term.kd_setmode(terminal::KdMode::Text)?;
             term.vt_setactivate(*vt)?;
         }
-        TerminalMode::Stdin | TerminalMode::Managed(_) => (),
+        TerminalMode::Stdin => (),
     }
     Ok(())
 }
@@ -37,7 +37,7 @@ fn wait_vt(term_mode: &TerminalMode) -> Result<(), Error> {
             let term = Terminal::open(path)?;
             term.vt_waitactive(*vt)?;
         }
-        TerminalMode::Stdin | TerminalMode::Managed(_) => (),
+        TerminalMode::Stdin => (),
     }
     Ok(())
 }
@@ -70,10 +70,7 @@ async fn client_handler(ctx: &Context, mut s: UnixStream) -> Result<(), Error> {
     loop {
         let req = match Request::read_from(&mut s).await {
             Ok(req) => req,
-            Err(CodecError::Eof) => {
-                let _ = ctx.cancel().await;
-                return Ok(());
-            }
+            Err(CodecError::Eof) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
 
@@ -92,9 +89,6 @@ async fn client_handler(ctx: &Context, mut s: UnixStream) -> Result<(), Error> {
             Request::CancelSession => wrap_result(ctx.cancel().await),
         };
 
-        if matches!(resp, Response::Error { .. }) {
-            let _ = ctx.cancel().await;
-        }
         resp.write_to(&mut s).await?;
     }
 }
@@ -114,9 +108,6 @@ async fn client_handler(ctx: &Context, mut s: UnixStream) -> Result<(), Error> {
 //
 // If the target is VtSelection::None, return nothing.
 fn get_tty(config: &Config) -> Result<TerminalMode, Error> {
-    if let Some(settings) = &config.file.general.multiseat {
-        return Ok(TerminalMode::Managed(Box::new(settings.clone())));
-    }
     const TTY_PREFIX: &str = "/dev/tty";
     const PTS_PREFIX: &str = "/dev/pts";
 
@@ -185,68 +176,22 @@ fn pam_service_exists(service: &str) -> bool {
 
 // Listener is a convenience wrapper for creating the UnixListener we need, and
 // for providing cleanup on Drop.
-struct Listener(UnixListener, Option<std::fs::File>);
+struct Listener(UnixListener);
 
 impl Listener {
-    fn create(
-        uid: Uid,
-        gid: Gid,
-        settings: Option<&crate::managed::Settings>,
-    ) -> Result<(String, Listener), Error> {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-        let (path, lock) = if let Some(settings) = settings {
-            let created = !Path::new(&settings.directory).try_exists()?;
-            std::fs::create_dir_all(&settings.directory)?;
-            let metadata = std::fs::symlink_metadata(&settings.directory)?;
-            if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-                return Err("managed run directory must be root-owned and non-writable".into());
-            }
-            if created {
-                std::fs::set_permissions(
-                    &settings.directory,
-                    std::fs::Permissions::from_mode(0o755),
-                )?;
-            }
-            let lock = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(format!(
-                    "{}/controller-{}.lock",
-                    settings.directory,
-                    settings.instance()
-                ))?;
-            let metadata = lock.metadata()?;
-            if !metadata.is_file()
-                || metadata.uid() != 0
-                || metadata.nlink() != 1
-                || metadata.mode() & 0o022 != 0
-            {
-                return Err("unsafe managed instance lock inode".into());
-            }
-            use std::os::fd::AsRawFd;
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
-                return Err("another greetd owns this managed instance".into());
-            }
-            (settings.socket_path(), Some(lock))
-        } else {
-            (format!("/run/greetd-{}.sock", getpid().as_raw()), None)
-        };
+    fn create(uid: Uid, gid: Gid) -> Result<(String, Listener), Error> {
+        let path = format!("/run/greetd-{}.sock", getpid().as_raw());
         let _ = std::fs::remove_file(&path);
         let listener =
             UnixListener::bind(&path).map_err(|e| format!("unable to open listener: {e}"))?;
         chown(path.as_str(), Some(uid), Some(gid))
             .map_err(|e| format!("unable to chown greetd socket at {path}: {e}"))?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        Ok((path, Listener(listener, lock)))
+        Ok((path, Listener(listener)))
     }
 }
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        let _lock = &self.1;
         let addr = match self.0.local_addr() {
             Ok(addr) => addr,
             Err(_) => return,
@@ -257,63 +202,25 @@ impl Drop for Listener {
     }
 }
 
-async fn worker_activity(activity: &mut Option<tokio::sync::watch::Receiver<u64>>) {
-    match activity {
-        Some(changed) => {
-            let _ = changed.changed().await;
-        }
-        None => std::future::pending().await,
-    }
-}
-async fn backend_failed(backend: Option<&crate::managed::Backend>) {
-    match backend {
-        Some(backend) => backend.failed().await,
-        None => std::future::pending().await,
-    }
-}
-
-pub async fn main(mut config: Config, started: &std::cell::Cell<bool>) -> Result<(), Error> {
-    let settings = config.file.general.multiseat.clone();
-    let available = |name: &str| {
-        if let Some(directory) = settings
-            .as_ref()
-            .and_then(|settings| settings.test_pam_dir.as_ref())
-        {
-            return Path::new(directory).join(name).is_file();
-        }
-        pam_service_exists(name)
-    };
-    let service = if available(&config.file.general.service) {
-        config.file.general.service.clone()
+pub async fn main(config: Config) -> Result<(), Error> {
+    let service = if pam_service_exists(&config.file.general.service) {
+        &config.file.general.service
     } else {
         return Err(format!("PAM '{}' service missing", config.file.general.service).into());
     };
 
-    let greeter_service = if available(&config.file.default_session.service) {
-        config.file.default_session.service.clone()
-    } else if settings.is_some() {
-        return Err("managed greeter PAM service is missing; no user-service fallback".into());
+    let greeter_service = if pam_service_exists(&config.file.default_session.service) {
+        &config.file.default_session.service
     } else {
-        service.clone()
+        service
     };
-    let owner = if let Some(settings) = &settings {
-        if unsafe { libc::geteuid() } != 0 {
-            return Err("managed greetd must run as root".into());
-        }
-        settings.validate()?;
-        Some(crate::managed::Owner::start()?)
-    } else {
-        None
-    };
-    let backend = owner.as_ref().map(crate::managed::Owner::backend);
-    let mut activity = backend.as_ref().map(crate::managed::Backend::subscribe);
 
     let u = nix::unistd::User::from_name(&config.file.default_session.user)?.ok_or(format!(
         "configured default session user '{}' not found",
-        config.file.default_session.user
+        &config.file.default_session.user
     ))?;
 
-    let (listener_path, listener) = Listener::create(u.uid, u.gid, settings.as_ref())?;
+    let (listener_path, listener) = Listener::create(u.uid, u.gid)?;
 
     let term_mode = get_tty(&config)?;
 
@@ -321,24 +228,24 @@ pub async fn main(mut config: Config, started: &std::cell::Cell<bool>) -> Result
         wait_vt(&term_mode).map_err(|e| format!("unable to wait VT: {e}"))?;
     }
 
-    let initial_session = config.file.initial_session.take();
-    config.file.general.service = service.clone();
-    config.file.default_session.service = greeter_service;
     let ctx = Rc::new(Context::new(
-        config.file,
+        config.file.default_session.command,
+        config.file.default_session.user,
+        greeter_service.to_string(),
+        service.to_string(),
         term_mode.clone(),
+        config.file.general.source_profile,
+        config.file.general.runfile,
         listener_path,
-        backend.clone(),
     ));
 
-    if let (Some(s), true) = (initial_session, ctx.is_first_run()) {
-        let initial_service = if available(&s.service) {
+    if let (Some(s), true) = (config.file.initial_session, ctx.is_first_run()) {
+        let initial_service = if pam_service_exists(&s.service) {
             &s.service
-        } else if settings.is_some() {
-            return Err("managed initial PAM service is missing".into());
         } else {
-            &service
+            service
         };
+
         if let Err(e) = ctx
             .start_user_session(&s.user, initial_service, vec![s.command])
             .await
@@ -346,49 +253,40 @@ pub async fn main(mut config: Config, started: &std::cell::Cell<bool>) -> Result
             eprintln!("unable to start greeter: {e}");
             reset_vt(&term_mode).map_err(|e| format!("unable to reset VT: {e}"))?;
 
-            return Err(e);
+            std::process::exit(1);
         }
     } else if let Err(e) = ctx.greet().await {
         eprintln!("unable to start greeter: {e}");
         reset_vt(&term_mode).map_err(|e| format!("unable to reset VT: {e}"))?;
 
-        return Err(e);
+        std::process::exit(1);
     }
 
     ctx.create_runfile();
-    started.set(true);
 
     let mut alarm = signal(SignalKind::alarm()).expect("unable to listen for SIGALRM");
     let mut child = signal(SignalKind::child()).expect("unable to listen for SIGCHLD");
     let mut term = signal(SignalKind::terminate()).expect("unable to listen for SIGTERM");
     let mut int = signal(SignalKind::interrupt()).expect("unable to listen for SIGINT");
 
-    let clients = std::sync::Arc::new(tokio::sync::Semaphore::new(32));
     loop {
         tokio::select! {
-            _ = worker_activity(&mut activity) => ctx.check_workers().await?,
-            _ = backend_failed(backend.as_ref()) => { if let Some(backend) = &backend { backend.stop_workers(); } ctx.terminate().await?; return Err("worker lifetime/device teardown failed; successor Start is not authorized".into()); }
-            _ = child.recv() => ctx.check_children().await.map_err(|e| format!("check_children: {}", e))?,
-            _ = alarm.recv() => ctx.alarm().await.map_err(|e| format!("alarm: {}", e))?,
+            _ = child.recv() => ctx.check_children().await.map_err(|e| format!("check_children: {e}"))?,
+            _ = alarm.recv() => ctx.alarm().await.map_err(|e| format!("alarm: {e}"))?,
             _ = term.recv() => {
-                if let Some(backend) = &backend { backend.stop_workers(); }
-                ctx.terminate().await.map_err(|e| format!("terminate: {}", e))?;
+                ctx.terminate().await.map_err(|e| format!("terminate: {e}"))?;
                 break;
             }
             _ = int.recv() => {
-                if let Some(backend) = &backend { backend.stop_workers(); }
-                ctx.terminate().await.map_err(|e| format!("terminate: {}", e))?;
+                ctx.terminate().await.map_err(|e| format!("terminate: {e}"))?;
                 break;
             }
             stream = listener.0.accept() => match stream {
                 Ok((stream, _)) => {
-                    if settings.is_some() && !matches!(stream.peer_cred()?.uid(), uid if uid == 0 || uid == u.uid.as_raw()) { continue; }
-                    let permit = match clients.clone().try_acquire_owned() { Ok(permit) => permit, Err(_) => continue };
                     let client_ctx = ctx.clone();
                     task::spawn_local(async move {
-                        let _permit = permit;
                         if let Err(e) = client_handler(&client_ctx, stream).await {
-                            if let Err(error) = client_ctx.cancel().await { eprintln!("session cancellation failed: {error}"); }
+                            client_ctx.cancel().await.expect("unable to cancel session");
                             eprintln!("client loop failed: {e}");
                         }
                     });
