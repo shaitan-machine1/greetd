@@ -71,6 +71,7 @@ impl Default for ConfigGeneral {
 
 #[derive(Debug, Eq, PartialEq, Default)]
 pub struct ConfigFile {
+    pub multiseatd: Option<crate::multiseatd::Config>,
     pub terminal: ConfigTerminal,
     pub general: ConfigGeneral,
     pub default_session: ConfigSession,
@@ -175,6 +176,35 @@ fn parse_config(config_str: &str) -> Result<ConfigFile, Error> {
         None => None,
     };
 
+    let multiseatd = match config.get("multiseatd") {
+        Some(section) => {
+            if config.contains_key("terminal") {
+                return Err("multiseatd and terminal settings are mutually exclusive".into());
+            }
+            for key in section.keys() {
+                if !matches!(*key, "seat" | "vt") {
+                    return Err(format!("unknown multiseatd setting: {key}").into());
+                }
+            }
+            let seat = maybe_unquote(section.get("seat").ok_or("multiseatd.seat is required")?)?;
+            libmultiseatd::bus_name(&seat).map_err(|e| e.to_string())?;
+            let value = maybe_unquote(section.get("vt").ok_or("multiseatd.vt is required")?)?;
+            let vt = match value.as_str() {
+                "none" => 0,
+                value => value
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|vt| (1..=63).contains(vt))
+                    .ok_or("multiseatd.vt must be 1..63 or \"none\"")?,
+            };
+            Some(crate::multiseatd::Config { seat, vt })
+        }
+        None => None,
+    };
+    if config.contains_key("multiseat") {
+        return Err("use [multiseatd], not [multiseat]".into());
+    }
+
     let terminal = match config.get("terminal") {
         Some(section) => Ok(ConfigTerminal {
             vt: maybe_unquote(section.get("vt").ok_or("VT not specified")?)
@@ -187,10 +217,12 @@ fn parse_config(config_str: &str) -> Result<ConfigFile, Error> {
                 .parse()
                 .map_err(|e| format!("could not parse switch: {e}"))?,
         }),
+        None if multiseatd.is_some() => Ok(ConfigTerminal::default()),
         None => Err("no terminal specified"),
     }?;
 
     Ok(ConfigFile {
+        multiseatd,
         initial_session,
         default_session,
         general,
@@ -243,6 +275,9 @@ pub fn read_config() -> Result<Config, Error> {
     let mut file = parse_config(&config_str)?;
 
     if let Some(vt) = matches.opt_str("vt") {
+        if file.multiseatd.is_some() {
+            return Err("--vt cannot override [multiseatd]; select an explicit config file".into());
+        }
         file.terminal.vt = vt.parse()?
     };
 
@@ -301,6 +336,7 @@ command = \"agreety\"
                 },
                 general: Default::default(),
                 initial_session: None,
+                multiseatd: None,
             }
         );
     }
@@ -334,6 +370,7 @@ user = \"john\"
                     user: "john".to_string(),
                     service: "greetd".to_string(),
                 }),
+                multiseatd: None,
             }
         );
         let config = parse_config(
@@ -364,6 +401,7 @@ service = \"greetd-autologin\"
                     user: "john".to_string(),
                     service: "greetd-autologin".to_string(),
                 }),
+                multiseatd: None,
             }
         );
     }
@@ -397,6 +435,7 @@ runfile = \"/path/to/greetd.state\"
                     service: "greetd".to_string(),
                 },
                 initial_session: None,
+                multiseatd: None,
             }
         );
     }
@@ -437,6 +476,7 @@ vt = 1
                 },
                 general: Default::default(),
                 initial_session: None,
+                multiseatd: None,
             }
         );
         let config = parse_config(
@@ -461,6 +501,7 @@ vt = next
                 },
                 general: Default::default(),
                 initial_session: None,
+                multiseatd: None,
             }
         );
         let config = parse_config(
@@ -485,8 +526,49 @@ vt = current
                 },
                 general: Default::default(),
                 initial_session: None,
+                multiseatd: None,
             }
         );
+    }
+
+    #[test]
+    fn multiseatd_config() {
+        for (value, vt) in [("7", 7), ("63", 63), ("\"none\"", 0)] {
+            let config = parse_config(&format!(
+                "[multiseatd]\nseat = \"seat-a_b\"\nvt = {value}\n[default_session]\ncommand = \"cage regreet\"\n"
+            )).unwrap();
+            assert_eq!(
+                config.multiseatd,
+                Some(crate::multiseatd::Config {
+                    seat: "seat-a_b".into(),
+                    vt,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_multiseatd_config() {
+        let base = "[default_session]\ncommand = \"cage regreet\"\n";
+        for section in [
+            "[multiseatd]\nseat = seat0\n",
+            "[multiseatd]\nvt = 7\n",
+            "[multiseatd]\nseat = other\nvt = 7\n",
+            "[multiseatd]\nseat = seat0\nvt = 0\n",
+            "[multiseatd]\nseat = seat0\nvt = 64\n",
+            "[multiseatd]\nseat = seat0\nvt = -1\n",
+            "[multiseatd]\nseat = seat0\nvt = current\n",
+            "[multiseatd]\nseat = seat0\nvt = next\n",
+            "[multiseatd]\nseat = seat0\nvt = 7\nrun_directory = /run/foo\n",
+            "[multiseatd]\nseat = seat0\nvt = 7\n[terminal]\nvt = 7\n",
+            "[multiseat]\nseat = seat0\nvt = 7\n",
+        ] {
+            assert!(
+                parse_config(&format!("{base}{section}")).is_err(),
+                "{}",
+                section
+            );
+        }
     }
 
     #[test]

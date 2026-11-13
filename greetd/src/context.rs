@@ -88,7 +88,16 @@ impl Context {
         user: &str,
         service: &str,
         cmd: Vec<String>,
+        foreground: bool,
     ) -> Result<SessionChild, Error> {
+        let mut term_mode = self.term_mode.clone();
+        if let TerminalMode::Multiseatd {
+            foreground: request,
+            ..
+        } = &mut term_mode
+        {
+            *request = foreground;
+        }
         let mut scheduled_session = Session::new_external()?;
         scheduled_session
             .initiate(
@@ -96,7 +105,7 @@ impl Context {
                 class,
                 user,
                 false,
-                &self.term_mode,
+                &term_mode,
                 self.source_profile,
                 &self.listener_path,
             )
@@ -116,12 +125,13 @@ impl Context {
     /// Directly start a greeter session, bypassing the normal scheduling. This
     /// function does not take the inner lock, and can thus be used while it is
     /// held.
-    async fn start_greeter(&self) -> Result<SessionChild, Error> {
+    async fn start_greeter(&self, foreground: bool) -> Result<SessionChild, Error> {
         self.start_unauthenticated_session(
             SessionClass::Greeter,
             &self.greeter_user,
             &self.greeter_service,
             vec![self.greeter_bin.to_string()],
+            foreground,
         )
         .await
     }
@@ -137,7 +147,7 @@ impl Context {
 
         let mut inner = self.inner.write().await;
         inner.current = Some(SessionChildSet {
-            child: self.start_greeter().await?,
+            child: self.start_greeter(true).await?,
             time: Instant::now(),
             is_greeter: true,
         });
@@ -173,7 +183,7 @@ impl Context {
         let mut inner = self.inner.write().await;
         inner.current = Some(SessionChildSet {
             child: self
-                .start_unauthenticated_session(SessionClass::User, user, service, cmd)
+                .start_unauthenticated_session(SessionClass::User, user, service, cmd, false)
                 .await?,
             time: Instant::now(),
             is_greeter: false,
@@ -350,8 +360,9 @@ impl Context {
                 // We got an exit, see if it's something we need to clean up.
                 Ok(WaitStatus::Exited(pid, ..)) | Ok(WaitStatus::Signaled(pid, ..)) => {
                     let mut inner = self.inner.write().await;
-                    let (was_greeter, sesion_length) = match &inner.current {
+                    let (was_greeter, sesion_length) = match &mut inner.current {
                         Some(s) if s.child.owns_pid(pid) => {
+                            s.child.check_teardown();
                             let res = (s.is_greeter, s.time.elapsed());
                             inner.current = None;
                             res
@@ -383,7 +394,7 @@ impl Context {
                                 sleep(Duration::from_secs(1)).await;
                             }
                             inner.current = Some(SessionChildSet {
-                                child: self.start_greeter().await?,
+                                child: self.start_greeter(false).await?,
                                 time: Instant::now(),
                                 is_greeter: true,
                             });

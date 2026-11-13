@@ -1,6 +1,7 @@
 mod config;
 mod context;
 mod error;
+mod multiseatd;
 mod pam;
 mod scrambler;
 mod server;
@@ -12,10 +13,9 @@ use std::os::unix::{
     net::UnixDatagram,
 };
 
-use nix::{
-    fcntl::{fcntl, FcntlArg, FdFlag},
-    sys::mman::{mlockall, MlockAllFlags},
-};
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+#[cfg(not(feature = "test-support"))]
+use nix::sys::mman::{mlockall, MlockAllFlags};
 use tokio::task;
 
 use crate::{error::Error, session::worker};
@@ -41,6 +41,8 @@ async fn main() {
     if cfg!(feature = "debug") {
         eprintln!("config: {config:?}");
     }
+    // The private harness may lack CAP_IPC_LOCK; there is no runtime bypass.
+    #[cfg(not(feature = "test-support"))]
     mlockall(MlockAllFlags::all()).expect("unable to lock pages");
     let res = task::LocalSet::new()
         .run_until(async move {

@@ -9,11 +9,11 @@ pub trait Scrambler {
 impl<T: Default> Scrambler for Vec<T> {
     fn scramble(&mut self) {
         let cap = self.capacity();
-        self.truncate(0);
+        self.clear();
         for _ in 0..cap {
             self.push(Default::default())
         }
-        self.truncate(0);
+        self.clear();
     }
 }
 
@@ -23,7 +23,7 @@ impl Scrambler for String {
         for v_iter in v.iter_mut() {
             *v_iter = 0
         }
-        self.truncate(0);
+        self.clear();
     }
 }
 

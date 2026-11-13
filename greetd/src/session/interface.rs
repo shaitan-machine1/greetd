@@ -59,6 +59,7 @@ impl AsyncRecv<SessionChildToParent> for SessionChildToParent {
 pub struct SessionChild {
     pub task: Pid,
     pub sub_task: Pid,
+    teardown: Option<UnixDatagram>,
 }
 
 impl SessionChild {
@@ -75,7 +76,36 @@ impl SessionChild {
     /// Send SIGKILL to the session child.
     pub fn kill(&self) {
         let _ = nix::sys::signal::kill(self.sub_task, Signal::SIGKILL);
-        let _ = nix::sys::signal::kill(self.task, Signal::SIGKILL);
+        // In multiseatd mode the PAM host must survive to withdraw access.
+        if self.teardown.is_none() {
+            let _ = nix::sys::signal::kill(self.task, Signal::SIGKILL);
+        }
+    }
+
+    /// Called after waitpid reports this PAM host's exit. Datagram sends precede
+    /// exit, so no waiting, EOF assumption or controller-side seat RPC is needed.
+    pub fn check_teardown(&mut self) {
+        if let Some(sock) = self.teardown.take() {
+            let mut data = [0; 10240];
+            let result = sock
+                .recv(&mut data)
+                .map_err(Error::from)
+                .and_then(|len| serde_json::from_slice(&data[..len]).map_err(Error::from));
+            match result {
+                Ok(SessionChildToParent::DeviceTeardown(result)) => require_teardown(result),
+                _ => require_teardown(Err("PAM host exited without device-removal proof".into())),
+            }
+        }
+    }
+}
+
+/// Stop this controller rather than letting a failed/uncertain withdrawal become
+/// an ordinary authentication error followed by a successor Start. Existing
+/// worker/compositor parent-death handling remains upstream's responsibility.
+fn require_teardown(result: Result<(), Error>) {
+    if let Err(error) = result {
+        eprintln!("fatal: multiseatd device teardown is not complete: {error}");
+        std::process::exit(1);
     }
 }
 
@@ -90,6 +120,8 @@ pub struct Session {
     task: Pid,
     sock: TokioUnixDatagram,
     last_msg: Option<SessionChildToParent>,
+    multiseatd: bool,
+    removed: bool,
 }
 
 impl Session {
@@ -99,6 +131,9 @@ impl Session {
         let (parentfd, childfd) =
             UnixDatagram::pair().map_err(|e| format!("could not create pipe: {e}"))?;
 
+        // Tokio requires a nonblocking descriptor; cancellation deadlines must
+        // remain pollable while a PAM host or SDK call is still running.
+        parentfd.set_nonblocking(true)?;
         let raw_child = childfd.as_raw_fd();
         let mut cur_flags = FdFlag::from_bits_retain(fcntl(raw_child, FcntlArg::F_GETFD)?);
         cur_flags.remove(FdFlag::FD_CLOEXEC);
@@ -130,6 +165,8 @@ impl Session {
             task: child,
             sock: TokioUnixDatagram::from_std(parentfd)?,
             last_msg: None,
+            multiseatd: false,
+            removed: false,
         })
     }
 
@@ -145,6 +182,7 @@ impl Session {
         source_profile: bool,
         listener_path: &str,
     ) -> Result<(), Error> {
+        self.multiseatd = matches!(term_mode, TerminalMode::Multiseatd { .. });
         let msg = ParentToSessionChild::InitiateLogin {
             service,
             class,
@@ -158,11 +196,33 @@ impl Session {
         Ok(())
     }
 
+    async fn recv_message(&mut self) -> Result<SessionChildToParent, Error> {
+        loop {
+            let message = SessionChildToParent::recv(&mut self.sock).await;
+            if self.multiseatd && !self.removed {
+                if let Err(error) = &message {
+                    require_teardown(Err(error.clone()));
+                }
+            }
+            match message? {
+                SessionChildToParent::DeviceTeardown(result) if self.multiseatd => {
+                    require_teardown(result);
+                    self.removed = true;
+                }
+                SessionChildToParent::Error(error) if self.multiseatd && !self.removed => {
+                    require_teardown(Err("PAM host failed without device-removal proof".into()));
+                    return Err(error);
+                }
+                message => return Ok(message),
+            }
+        }
+    }
+
     /// Return the current state of this session.
     pub async fn get_state(&mut self) -> Result<SessionState, Error> {
         let msg = match self.last_msg.take() {
             Some(msg) => msg,
-            None => SessionChildToParent::recv(&mut self.sock).await?,
+            None => self.recv_message().await?,
         };
 
         self.last_msg = Some(msg.clone());
@@ -183,7 +243,37 @@ impl Session {
     /// Cancel the session.
     pub async fn cancel(&mut self) -> Result<(), Error> {
         self.last_msg = None;
-        ParentToSessionChild::Cancel.send(&mut self.sock).await?;
+        let sent = ParentToSessionChild::Cancel.send(&mut self.sock).await;
+        if self.multiseatd && !self.removed {
+            require_teardown(sent.clone());
+        }
+        sent?;
+        if self.multiseatd && !self.removed {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(12), async {
+                while !self.removed {
+                    match SessionChildToParent::recv(&mut self.sock).await? {
+                        SessionChildToParent::DeviceTeardown(result) => {
+                            require_teardown(result);
+                            self.removed = true;
+                        }
+                        SessionChildToParent::PamMessage { .. } => {
+                            ParentToSessionChild::PamResponse { resp: None }
+                                .send(&mut self.sock)
+                                .await?;
+                        }
+                        SessionChildToParent::Error(_) => {
+                            return Err("PAM host failed without device-removal proof".into())
+                        }
+                        _ => {}
+                    }
+                }
+                Ok::<(), Error>(())
+            })
+            .await;
+            require_teardown(
+                result.unwrap_or_else(|_| Err("device-removal result timed out".into())),
+            );
+        }
         Ok(())
     }
 
@@ -209,7 +299,7 @@ impl Session {
         let msg = ParentToSessionChild::Args { env, cmd };
         msg.send(&mut self.sock).await?;
 
-        let msg = SessionChildToParent::recv(&mut self.sock).await?;
+        let msg = self.recv_message().await?;
 
         self.last_msg = Some(msg.clone());
 
@@ -231,7 +321,7 @@ impl Session {
         msg.send(&mut self.sock).await?;
 
         let sub_task = loop {
-            match SessionChildToParent::recv(&mut self.sock).await? {
+            match self.recv_message().await? {
                 SessionChildToParent::Error(e) => return Err(e),
                 SessionChildToParent::FinalChildPid(raw_pid) => {
                     break Pid::from_raw(raw_pid as i32)
@@ -250,11 +340,99 @@ impl Session {
             };
         };
 
-        self.sock.shutdown(std::net::Shutdown::Both)?;
+        let teardown = if self.multiseatd {
+            use std::os::fd::AsFd;
+            let fd = self.sock.as_fd().try_clone_to_owned()?;
+            Some(UnixDatagram::from(fd))
+        } else {
+            self.sock.shutdown(std::net::Shutdown::Both)?;
+            None
+        };
 
         Ok(SessionChild {
             task: self.task,
             sub_task,
+            teardown,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn teardown_result_child() {
+        let case = match std::env::var("GREETD_TEST_TEARDOWN_CASE") {
+            Ok(case) => case,
+            Err(_) => return,
+        };
+        let (parent, peer) = UnixDatagram::pair().unwrap();
+        parent.set_nonblocking(true).unwrap();
+        match case.as_str() {
+            "success" | "later-pam-failure" => {
+                SessionChildToParent::DeviceTeardown(Ok(()))
+                    .send(&peer)
+                    .unwrap();
+                if case == "later-pam-failure" {
+                    SessionChildToParent::Error("PAM close failed".into())
+                        .send(&peer)
+                        .unwrap();
+                }
+            }
+            "pending" => {
+                SessionChildToParent::DeviceTeardown(Err("Pending".into()))
+                    .send(&peer)
+                    .unwrap();
+            }
+            "error-without-proof" => {
+                SessionChildToParent::Error("worker failed".into())
+                    .send(&peer)
+                    .unwrap();
+            }
+            "timeout" | "worker-death" => {}
+            _ => panic!("unknown test case"),
+        }
+        drop(peer);
+        let mut child = SessionChild {
+            task: Pid::from_raw(1),
+            sub_task: Pid::from_raw(1),
+            teardown: Some(parent),
+        };
+        child.check_teardown();
+        assert!(matches!(case.as_str(), "success" | "later-pam-failure"));
+    }
+
+    #[test]
+    fn only_positive_device_result_authorizes_handoff() {
+        for (case, code) in [
+            ("success", 0),
+            ("later-pam-failure", 0),
+            ("pending", 1),
+            ("timeout", 1),
+            ("worker-death", 1),
+            ("error-without-proof", 1),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "session::interface::tests::teardown_result_child",
+                    "--nocapture",
+                ])
+                .env("GREETD_TEST_TEARDOWN_CASE", case)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(code),
+                "{}: {}",
+                case,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if code == 1 {
+                assert!(String::from_utf8_lossy(&output.stderr)
+                    .contains("device teardown is not complete"));
+            }
+        }
     }
 }

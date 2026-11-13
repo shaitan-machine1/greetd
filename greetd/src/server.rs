@@ -26,7 +26,7 @@ fn reset_vt(term_mode: &TerminalMode) -> Result<(), Error> {
             term.kd_setmode(terminal::KdMode::Text)?;
             term.vt_setactivate(*vt)?;
         }
-        TerminalMode::Stdin => (),
+        TerminalMode::Stdin | TerminalMode::Multiseatd { .. } => (),
     }
     Ok(())
 }
@@ -37,7 +37,7 @@ fn wait_vt(term_mode: &TerminalMode) -> Result<(), Error> {
             let term = Terminal::open(path)?;
             term.vt_waitactive(*vt)?;
         }
-        TerminalMode::Stdin => (),
+        TerminalMode::Stdin | TerminalMode::Multiseatd { .. } => (),
     }
     Ok(())
 }
@@ -108,6 +108,12 @@ async fn client_handler(ctx: &Context, mut s: UnixStream) -> Result<(), Error> {
 //
 // If the target is VtSelection::None, return nothing.
 fn get_tty(config: &Config) -> Result<TerminalMode, Error> {
+    if let Some(config) = &config.file.multiseatd {
+        return Ok(TerminalMode::Multiseatd {
+            config: config.clone(),
+            foreground: false,
+        });
+    }
     const TTY_PREFIX: &str = "/dev/tty";
     const PTS_PREFIX: &str = "/dev/pts";
 
@@ -217,7 +223,7 @@ pub async fn main(config: Config) -> Result<(), Error> {
 
     let u = nix::unistd::User::from_name(&config.file.default_session.user)?.ok_or(format!(
         "configured default session user '{}' not found",
-        &config.file.default_session.user
+        config.file.default_session.user
     ))?;
 
     let (listener_path, listener) = Listener::create(u.uid, u.gid)?;
@@ -297,4 +303,36 @@ pub async fn main(config: Config) -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn multiseatd_binding_never_uses_native_terminal_paths() {
+        for vt in [0, 7, 63] {
+            // Even a conflicting internal terminal value cannot cause an open/ioctl.
+            let file = crate::config::ConfigFile {
+                multiseatd: Some(crate::multiseatd::Config {
+                    seat: "seat-test".into(),
+                    vt,
+                }),
+                terminal: crate::config::ConfigTerminal {
+                    vt: VtSelection::Current,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let config = Config {
+                file,
+                internal: Default::default(),
+            };
+            let mode = get_tty(&config).unwrap();
+            assert!(
+                matches!(&mode, TerminalMode::Multiseatd { config, foreground: false } if config.vt == vt)
+            );
+            wait_vt(&mode).unwrap();
+            reset_vt(&mode).unwrap();
+        }
+    }
 }

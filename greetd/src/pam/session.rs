@@ -98,6 +98,14 @@ impl<'a> PamSession<'a> {
         }
     }
 
+    /// pam_putenv reports BAD_ITEM when deleting a variable that is absent.
+    pub fn unsetenv(&mut self, name: &str) -> Result<(), PamError> {
+        if pam_sys::getenv(self.handle, name).is_some() {
+            self.putenv(name)?;
+        }
+        Ok(())
+    }
+
     pub fn set_item(&mut self, item: PamItemType, value: &str) -> Result<(), PamError> {
         let s = CString::new(value).unwrap();
         self.last_code = PamReturnCode::from(unsafe {

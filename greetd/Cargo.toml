@@ -9,6 +9,8 @@ repository = "https://git.sr.ht/~kennylevinsen/greetd/"
 
 [features]
 debug = []
+# Disposable PAM/bus harness only; production packages must not enable this.
+test-support = []
 
 [dependencies]
 nix = { version = "0.28", features = ["ioctl", "signal", "user", "fs", "mman"] }
@@ -23,3 +25,4 @@ getopts = "0.2"
 thiserror = "1.0"
 async-trait = "0.1"
 enquote = "1.1"
+lib-multiseatd = { git = "https://github.com/shaitan-machine1/multiseatd.git", rev = "49834268db6fdfee8f061f6c13392d54b1f6fe83" }
